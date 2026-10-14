@@ -1,0 +1,60 @@
+THE PUBLIC FESTIVAL - SETUP (Round 66)
+One festival that is always open. Anyone joins or leaves any time, and nobody hosts it.
+
+STEP 1 - UPDATE THE SERVER
+ 1. Go to github.com and open your repository "festival-tycoon-relay".
+ 2. Click "Add file" > "Upload files".
+ 3. From the game's "server" folder, drag in: relay.js, patchbay.js, payments.js, applications.js,
+    README.txt, PUBLIC_FESTIVAL_SETUP.txt
+ 4. Click "Commit changes". Render restarts the server by itself. Wait 2-5 minutes until it says "Live".
+ 5. Check it: open https://YOUR-SERVER.onrender.com/healthz in your browser. It should say: ok
+
+STEP 2 - PICK HOW IT STAYS ON
+ Option A - free ($0)
+  The free server sleeps after 15 quiet minutes. A free "pinger" keeps it awake:
+  1. Make a free account at uptimerobot.com.
+  2. "Add New Monitor" > Type: HTTP(s) > URL: https://YOUR-SERVER.onrender.com/healthz
+     > Interval: 5 minutes > "Create".
+  Good to know:
+  - When you update the server (or Render restarts it), players are kicked out for a few seconds.
+    Their games reconnect by themselves.
+  - A restart forgets the DJ schedule. After changing it, press "Download backup" on the DJ page,
+    then render.com > your service > "Environment" > "Secret Files" > add a file named
+    patchbay.json and paste the whole backup in. (README.txt, "KEEPING THE PATCH BAY".)
+
+ Option B - about $7 a month (rock solid)
+  1. render.com > your service > "Settings" > Instance Type: "Starter" > Save. It never sleeps.
+  2. "Disks" > "Add Disk": Name store-data, Mount Path /var/data, Size 1 GB > Save.
+  3. "Environment" > add STORE_DATA_DIR with the value /var/data.
+  Now the DJ schedule saves itself. No pinger needed.
+
+STEP 3 - SETTINGS (optional)
+ render.com > your service > "Environment" > "Add Environment Variable", then "Save":
+  PUBLIC_CAPACITY      most people inside at once (normally 60)
+  PUBLIC_DAY_SECONDS   length of one festival day in seconds (normally 7200 = 2 hours)
+  ADMIN_KEY            your admin password (needed for the DJ page; probably already set)
+
+STEP 4 - ADD DJ SET TIMES
+ 1. Open https://YOUR-SERVER.onrender.com/admin/patch and type your ADMIN_KEY.
+ 2. Add your DJs at the bottom of the page (if they aren't there yet).
+ 3. Find the card "The public festival (always open, 24/7)".
+ 4. Click "+ Patch a DJ into this event". Pick a stage and a DJ.
+ 5. When: "At a set time" > pick the date and time > type the set length in minutes.
+ 6. Click "Patch DJ". The DJ goes live by themselves at that time, and the game's schedule shows it.
+
+STEP 5 - ARTIST APPLICATIONS (Round 67)
+ DJs, VJs and live acts can ask to perform:
+  - in the game: Menu > "Perform here (DJ / VJ / artist)"
+  - or on the web: https://YOUR-SERVER.onrender.com/apply
+ Each one gets a private code to check on their application.
+ 1. Open https://YOUR-SERVER.onrender.com/admin/applications and type your ADMIN_KEY.
+ 2. Read each card (their links open in a new tab). Type a note if you like - they see it.
+ 3. Approve: they join the DJ roster, and their code now shows their private DJ page link.
+    Then give them a set time (STEP 4). Decline: they see "not this time" and your note.
+ Free server: applications are forgotten when it restarts - check them often, or add the
+ $7 disk (STEP 2, option B).
+
+HOW PLAYERS JOIN
+ 1. Once: Settings > Play with friends > "Paste server address".
+ 2. The game shows how many people are inside. Press join and walk in.
+ 3. Switch roles (festival-goer, DJ, vendor, medic, security, crew) any time while playing.

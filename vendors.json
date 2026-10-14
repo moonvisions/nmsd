@@ -1,0 +1,130 @@
+{
+  "version": 1,
+  "features": {
+    "artistVenues": false,
+    "ticketSales": false
+  },
+  "vendors": [
+    {
+      "id": "sample-wire",
+      "name": "Wire and Stone (sample)",
+      "tagline": "Hand-wrapped crystal pendants and cuffs",
+      "store": "",
+      "colour": "#7a4bd6",
+      "items": [
+        {
+          "id": "amethyst",
+          "name": "Amethyst wire wrap",
+          "kind": "pendant",
+          "colour": "#c9a36b",
+          "accent": "#9b5cff",
+          "price": 60
+        },
+        {
+          "id": "moonstone",
+          "name": "Moonstone spiral",
+          "kind": "pendant",
+          "colour": "#d9d9e6",
+          "accent": "#bfe8ff",
+          "price": 80
+        },
+        {
+          "id": "copper-cuff",
+          "name": "Copper wrap cuff",
+          "kind": "bracelet",
+          "colour": "#c87533",
+          "accent": "#35d0a0",
+          "price": 45
+        }
+      ]
+    },
+    {
+      "id": "sample-threads",
+      "name": "Sunset Threads (sample)",
+      "tagline": "Handmade festival wear, one of a kind",
+      "store": "",
+      "colour": "#f07a3c",
+      "items": [
+        {
+          "id": "tie-dye",
+          "name": "Sunset tie-dye tee",
+          "kind": "tee",
+          "colour": "#ff7a45",
+          "accent": "#ffd23f",
+          "pattern": "tiedye",
+          "price": 50
+        },
+        {
+          "id": "galaxy-hoodie",
+          "name": "Galaxy hoodie",
+          "kind": "hoodie",
+          "colour": "#26215c",
+          "accent": "#ff5fd2",
+          "pattern": "spiral",
+          "print": "STARDUST",
+          "price": 90
+        },
+        {
+          "id": "desert-bucket",
+          "name": "Desert bucket hat",
+          "kind": "bucket",
+          "colour": "#d9b27c",
+          "accent": "#7a4b2a",
+          "price": 40
+        },
+        {
+          "id": "paisley",
+          "name": "Paisley bandana",
+          "kind": "bandana",
+          "colour": "#b8243c",
+          "accent": "#ffffff",
+          "pattern": "dots",
+          "price": 25
+        }
+      ]
+    },
+    {
+      "id": "sample-glow",
+      "name": "Night Owl Glow (sample)",
+      "tagline": "Light-up gear for after dark",
+      "store": "",
+      "colour": "#19c2c9",
+      "items": [
+        {
+          "id": "shades",
+          "name": "Prism shades",
+          "kind": "glasses",
+          "colour": "#111111",
+          "accent": "#35f0ff",
+          "price": 35
+        },
+        {
+          "id": "cap",
+          "name": "Glow logo cap",
+          "kind": "cap",
+          "colour": "#1b1b24",
+          "accent": "#35f0ff",
+          "price": 30
+        },
+        {
+          "id": "totem",
+          "name": "Jellyfish totem",
+          "kind": "totem",
+          "colour": "#c9c9d4",
+          "accent": "#ff6ad5",
+          "price": 120
+        },
+        {
+          "id": "pack",
+          "name": "Hydration pack",
+          "kind": "backpack",
+          "colour": "#2d6b4f",
+          "accent": "#9cff57",
+          "price": 55
+        }
+      ]
+    }
+  ],
+  "tracks": [],
+  "venues": []
+}

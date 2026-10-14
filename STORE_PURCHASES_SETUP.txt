@@ -1,0 +1,81 @@
+IN-GAME PURCHASES ON STEAM, GOOGLE PLAY AND THE APP STORE (Round 69)
+=====================================================================
+Steam, Google and Apple require their OWN payments inside their versions of the game (Stripe stays
+for the website). Your server checks every purchase with the store, and adds each one only once.
+
+WHAT YOU SELL (make these EXACT ids, at these prices, in each store)
+  Product id (Google + Apple)                          What                 Price   Steam item
+  com.moonvisionmedia.newmoonsamedark.credits500       500 Moon Shards      $4.99   1001
+  com.moonvisionmedia.newmoonsamedark.credits1100      1,100 Moon Shards    $9.99   1002
+  com.moonvisionmedia.newmoonsamedark.credits2400      2,400 Moon Shards    $19.99  1003
+  com.moonvisionmedia.newmoonsamedark.credits6500      6,500 Moon Shards    $49.99  1004
+  com.moonvisionmedia.newmoonsamedark.bignightpass     Big Night pass       $3.99   2001
+Outfits and vendor designs are bought WITH shards. (This list is also on /admin.)
+
+STEP 0 - UPDATE THE SERVER
+ 1. GitHub > your server repository > "Add file" > "Upload files".
+ 2. Drag in: storeverify.js, store.js, README.txt and this file. Click "Commit changes".
+ 3. Render > your service > Environment: for Big Night passes add BIGNIGHT_MODE = paid
+ 4. After adding each setting below, click "Save Changes" (Render restarts by itself).
+
+STEP 1 - STEAM
+ 1. partner.steamgames.com > Users & Permissions > Manage Groups > your publisher group.
+ 2. Find "Web API Key" (click "Create WebAPI Key" if there isn't one). Copy it - it's a secret.
+ 3. On Render add:  STEAM_WEB_API_KEY = (the key)     STEAM_APP_ID = (your App ID number)
+ 4. Nothing to create in Steamworks: the server tells Steam the item and price (USD, EUR, GBP, CAD
+    or AUD - whatever the player's Steam wallet uses).
+ TEST WITHOUT REAL MONEY:
+ 5. Add STEAM_SANDBOX = 1 AND ALLOW_STEAM_SANDBOX_IN_PROD = 1 (without the second one, the live
+    server switches Steam purchases OFF - so you can't forget test mode on).
+ 6. Start the game FROM STEAM, sign in, Store > Buy, approve the Steam box. "(test purchase)" appears.
+ 7. DELETE both settings when done.
+
+STEP 2 - GOOGLE PLAY
+ 1. Play Console > your app > Monetize > Products > In-app products: "Create product" for EACH id
+    above, with its price. Click "Activate".
+ 2. console.cloud.google.com: pick or create a project. Search "Google Play Android Developer API" > "Enable".
+ 3. Menu > IAM & Admin > Service Accounts > "Create service account" ("newmoon-purchases") > "Done".
+ 4. Click it > "Keys" > "Add key" > "Create new key" > JSON > "Create". A .json file downloads.
+ 5. Copy the service account's email (ends in .iam.gserviceaccount.com).
+ 6. Play Console (main page) > Users and permissions > "Invite new users": paste the email. Under
+    "App permissions" add your app, tick "View financial data, orders, and cancellation survey
+    responses" and "Manage orders and subscriptions". Click "Invite user".
+ 7. Open the .json in Notepad/TextEdit, copy ALL of it. On Render: GOOGLE_SERVICE_ACCOUNT_JSON = (paste)
+ 8. /admin should say Google Play "ready" (permissions can take up to 24 hours).
+ REFUNDS ARRIVE BY THEMSELVES (recommended):
+ 9. Make up a long password (20+ letters/numbers). On Render: GOOGLE_RTDN_SECRET = (it)
+10. Google Cloud > Pub/Sub > Topics > "Create topic" ("play-notifications"). Open it > Permissions >
+    "Add principal": google-play-developer-notifications@system.gserviceaccount.com, role "Pub/Sub Publisher".
+11. In the topic: "Create subscription" > Delivery type "Push" > Endpoint:
+    https://server.newmoonsamedark.com/store/google/rtdn?secret=(your password) > "Create".
+12. Play Console > your app > Monetize > Monetization setup > Real-time developer notifications:
+    paste the topic name (projects/.../topics/play-notifications) > "Send test notification" > Save.
+ TEST WITHOUT REAL MONEY:
+13. Play Console > Settings > License testing: add your Gmail. Install from an internal testing track.
+    Purchases are free and marked TEST on /admin.
+
+STEP 3 - APPLE APP STORE
+ 1. App Store Connect > your app > Monetization > In-App Purchases > "+": type CONSUMABLE, the EXACT
+    product id, price, display name, review screenshot. Repeat for each product.
+ 2. Users and Access > Integrations > In-App Purchase > "Generate In-App Purchase Key".
+    Download the .p8 (only ONCE). Note its "Key ID" and the "Issuer ID" at the top.
+ 3. On Render add:  APPLE_ISSUER_ID   APPLE_KEY_ID   APPLE_PRIVATE_KEY = (all of the .p8, from Notepad)
+ 4. Add APPLE_ALLOW_SANDBOX = 1 and KEEP it: Apple's reviewers buy in the free "sandbox".
+    Sandbox purchases are marked TEST on /admin, and one button takes them all back.
+ 5. REFUNDS BY THEMSELVES: your app > App Information > App Store Server Notifications: Production
+    AND Sandbox URL = https://server.newmoonsamedark.com/store/apple/notify  Version 2. Save.
+ TEST WITHOUT REAL MONEY:
+ 6. Users and Access > Sandbox > Testers > "+": make a test Apple account.
+ 7. iPhone: Settings > App Store > Sandbox Account: sign in with it. Buy in the TestFlight build
+    (free). Try "Restore purchases" too.
+
+STEP 4 - THE GAME (Unity)
+ 1. Window > Package Manager > "+" > "Add package by name". Name: com.unity.purchasing
+    Version: 4.15.1 (exactly - Google requires its Billing 8; NOT 5.x). Click "Add".
+ 2. Steam builds need Steamworks.NET; a Steam build without it is stopped (it would use Stripe).
+
+REFUNDS AND PROBLEMS
+ - Refunds are taken back automatically (notifications, plus a check every 6 hours). /admin also has
+   "Check ... for refunds now" and a "Revoke" button per purchase.
+ - A red "Purchases need your attention" box on /admin = a setting is wrong (package name, bundle id,
+   key). Those purchases are KEPT and added once you fix it.
