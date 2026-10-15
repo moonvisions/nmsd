@@ -741,14 +741,14 @@ up (upload, keeping it awake for free or for about $7 a month, DJ set times): se
 
 PLAY STATS - YOUR PRIVATE DASHBOARD (Round 71)
 Who plays, for how long, what they do, and money - on one password-protected page:
-    https://server.newmoonsamedark.com/admin/stats
+    https://nmsd.onrender.com/admin/stats
 It's also on your /admin page ("Play stats" > Open play stats).
 
 ONE-TIME SETUP
  1. Upload analytics.js (new) plus the changed relay.js, payments.js, store.js and .gitignore to GitHub,
     the same way as before. Render restarts the server by itself.
- 2. The password is your ADMIN_KEY (the same one as /admin). To make it MoonVision:
-    Render > your server > Environment > ADMIN_KEY > Edit > type MoonVision > Save Changes.
+ 2. The password is your ADMIN_KEY (the same one as /admin). To set or change it:
+    Render > your server > Environment > ADMIN_KEY > Edit > type your password > Save Changes.
     (It must be at least 8 letters. Never put the password in a file on GitHub - your repository is public.)
  3. To KEEP the numbers when the server restarts, the server needs the permanent disk (STORE_DATA_DIR - see
     "Moon Shards", step B). Without it the page works but starts from zero after every restart, and says so.
@@ -770,3 +770,85 @@ GOOD TO KNOW
  - Days are counted in UTC (a new day starts at 8 pm US Eastern in summer, 7 pm in winter).
  - 10 wrong passwords from one address lock that address out for 10 minutes.
  - Files on the disk: analytics.json (everything) and analytics.json.bak (the version before).
+
+
+==========================================================================================================
+LIVE ACCOUNTS (Round 74) - username, email, password for the Open Festival
+==========================================================================================================
+
+WHAT PLAYERS SEE
+ - The first time someone joins the Open Festival (live mode), the game asks them to MAKE A LIVE ACCOUNT:
+   a username (everyone at the festival sees it), their email (never shown to other players) and a
+   password (8+ characters), and to tick "I'm 13 or older, and I agree to the Terms of Service and the
+   Privacy Policy" (both open in the browser from that screen).
+ - After that the device stays signed in. On another device they SIGN IN with their username (or email)
+   and password.
+ - Settings > Game > Live account: change password, sign out, delete account, read the Terms / Privacy.
+ - Forgot password? The game tells them to email daniel@moonvisionmedia.com. You reset it (below).
+ - The Terms of Service:  https://nmsd.onrender.com/terms
+   The Privacy Policy:    https://nmsd.onrender.com/privacy
+
+YOUR ADMIN PAGE - every account
+ - https://nmsd.onrender.com/admin/players  >  your admin password (ADMIN_KEY).
+ - You see every username and email, when they joined, when they last played and which terms they agreed
+   to. Search box at the top.
+ - "Download usernames + emails (CSV)" - opens in Excel / Google Sheets.
+ - "New password" on a row - makes a new password for that player and shows it to you ONCE. Email it to
+   them; they can change it in the game. (Passwords are stored scrambled - nobody can read them, not even
+   you. That's on purpose and it protects you.)
+ - "Delete" on a row - removes the account for good.
+ - "Download full backup" - one file with every account. Keep it somewhere private (it has emails).
+   "Restore from a full backup" adds a backup's accounts back (it never removes anyone, and never brings
+   back an account that was deleted).
+
+KEEPING ACCOUNTS FOREVER - DO AT LEAST ONE OF THESE (both is best)
+ A free Render server FORGETS its files every time it redeploys (every GitHub upload). The admin page
+ shows "Safe disk" and "GitHub backup" - at least one must say ON.
+
+ A. RENDER DISK (simplest, needs a paid Render instance):
+    1. Render > nmsd > Settings: Instance type "Starter" (or higher).
+    2. Render > nmsd > Disks > Add disk: Name "data", Mount path /var/data, Size 1 GB > Save.
+    3. Render > nmsd > Environment > Add: STORE_DATA_DIR = /var/data > Save (it redeploys).
+    (This same disk also keeps Moon Shards, play stats, the patch bay and artist applications.)
+
+ B. PRIVATE GITHUB BACKUP (free - works even without a disk):
+    1. GitHub > the + at the top right > New repository. Name: nmsd-data. Choose PRIVATE (never public!).
+       Tick "Add a README file". Create repository.
+    2. GitHub > your picture (top right) > Settings > Developer settings > Personal access tokens >
+       Fine-grained tokens > Generate new token.
+         Name: nmsd backup   Expiration: No expiration (or 1 year - put a reminder to renew it)
+         Repository access: Only select repositories > nmsd-data
+         Permissions > Repository permissions > Contents: Read and write
+       Generate token > COPY it (you only see it once).
+    3. Render > nmsd > Environment > Add these, then Save:
+         BACKUP_GITHUB_REPO   = moonvisions/nmsd-data
+         BACKUP_GITHUB_TOKEN  = (the token you copied)
+         BACKUP_KEY           = a long secret phrase only you know (write it down somewhere safe!)
+       The accounts are ENCRYPTED with BACKUP_KEY before they go to GitHub. Never change BACKUP_KEY later
+       (old backups would no longer open). If you don't set it, ADMIN_KEY is used - then never change that.
+    4. Open /admin/players: "GitHub backup: ON - last saved ..." appears within a minute of the first
+       sign-up. A file players.backup.json appears in nmsd-data.
+    How it works: a few seconds after every new account / password change / deletion, the server saves the
+    encrypted list to nmsd-data. When the server starts (after every update), it loads the newest copy
+    (disk or GitHub) before letting anyone in. If GitHub can't be reached and there's no disk copy, the
+    server says "starting up - try again" instead of starting empty - so nobody is ever asked to sign up
+    again by mistake.
+
+ C. Now and then (monthly is fine): /admin/players > "Download full backup" and keep the file safe.
+
+SETTINGS (Render > nmsd > Environment)
+ - ADMIN_KEY             your admin password (already set - only ever here, never in a GitHub file).
+ - STORE_DATA_DIR        the disk (A above).
+ - BACKUP_GITHUB_REPO / BACKUP_GITHUB_TOKEN / BACKUP_KEY    the GitHub backup (B above).
+ - CONTACT_EMAIL         the help email on the Terms / Privacy pages (default daniel@moonvisionmedia.com).
+ - LIVE_SIGNUP_REQUIRED  "0" turns accounts off (anyone can join live without one). Default: required.
+
+GOOD TO KNOW
+ - Game updates never touch accounts: they live on this server. The device only keeps a sign-in key
+   (never the password), and the game copies it into its own backup before each new version runs.
+ - Android: always sign every APK with the SAME keystore, or phones refuse the update. (Even then, the
+   player just signs in again - the account is on the server.)
+ - Older copies of the game (without accounts) are told to update before they can join live.
+ - The Terms of Service and Privacy Policy are a solid generic starting point written for Moon Vision
+   Media LLC - have a lawyer look them over when you can (especially the arbitration section and which
+   state's law applies).

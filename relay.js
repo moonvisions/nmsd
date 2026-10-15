@@ -188,6 +188,7 @@ const patchbay = require('./patchbay');           // Round 60: the DJ patch bay
 const worlds = require('./worlds');               // Round 63: saved worlds
 const applications = require('./applications');   // Round 67: artists applying to play the Open Festival (/apply)
 const analytics = require('./analytics');   // Round 71: play stats (/stats/*, /admin/stats)
+const players = require('./players');       // Round 74: live sign-up - a username and email for the Open Festival (/players/*, /admin/players)
 const crypto = require('crypto');
 const eventRooms = new Map();      // Round 50: live event id -> its room code
 payments.setLiveEvents(eventRooms);
@@ -973,7 +974,11 @@ function publicConnect(ws, url, ip) {
   let fromHere = 0;
   publicEach(room, other => { if (other.ip === ip && !other.pubGone) fromHere++; });
   if (fromHere >= PUBLIC_PER_IP) { refuse(`Only ${PUBLIC_PER_IP} players from one network can be in the public festival at once.`); return; }
-  ws.pname = publicName(room, url.searchParams.get('name'));
+  // Round 74: live mode needs a sign-up (a username and email) - and everyone there sees that username.
+  if (players.required() && !players.isReady()) { refuse('The server is just starting up - try again in a few seconds.'); return; }
+  const signedUp = players.check(url.searchParams.get('pt') || '');
+  if (!signedUp && players.required()) { refuse('signup: Make a live account (username, email and password) to join the Open Festival. (Update the game if it doesn\'t ask you.)'); return; }
+  ws.pname = publicName(room, signedUp ? signedUp.username : url.searchParams.get('name'));
   ws.role = 'goer';
   ws.joinedAt = now;
   ws.lastMsgAt = now;
@@ -1099,6 +1104,7 @@ function handleHttp(req, res) {
   if (req.url && worlds.handle(req, res)) return;         // Round 63: saved worlds (/worlds/...)
   if (req.url && applications.handle(req, res)) return;   // Round 67: artist applications (/apply, /apply/status, /admin/applications)
   if (req.url && analytics.handle(req, res)) return;      // Round 71: play stats (/stats/start, /stats/beat, /stats/events, /admin/stats)
+  if (req.url && players.handle(req, res)) return;        // Round 74: live sign-up (/players/signup, /players/signin, /players/me, /admin/players)
   // Round 33: the Vendor Village list. Edit vendors.json (on GitHub) and the game picks it up.
   if (req.url && req.url.split('?')[0] === '/vendors.json') {
     fs.readFile(VENDORS_FILE, 'utf8', (err, text) => {
@@ -1540,10 +1546,13 @@ for (const signal of ['SIGTERM', 'SIGINT']) {
     leaderboards.flush(); reports.flush(); patchbay.flush(); worlds.flush();   // Round 60: + the patch bay. Round 63: + saved worlds
     applications.flush();   // Round 67: + artist applications
     analytics.flush();      // Round 71: + play stats
-    setTimeout(() => {
+    // Round 74: + the live accounts (to disk, and the off-site backup if one is waiting - up to 6 s).
+    const accounts = Promise.race([players.final().catch(err => console.error('players final', err && err.message)), new Promise(r => setTimeout(r, 6000))]);
+    const quiet = new Promise(r => setTimeout(r, 300));
+    Promise.all([accounts, quiet]).then(() => {
       try { publicEach(publicRoom, ws => ws.close(1012, 'server restarting')); } catch { /* exiting anyway */ }
       setTimeout(() => process.exit(0), 150);
-    }, 300);
+    });
   });
 }
 

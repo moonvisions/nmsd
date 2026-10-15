@@ -396,6 +396,7 @@ ${note ? `<div class="code" style="font-size:15px;letter-spacing:0;text-align:le
 ${patchbay.adminSection(hidden)}
 ${applications.adminSection(hidden)}
 ${analytics().adminSection(hidden)}
+${require('./players').adminSection(hidden)}
 <h2>Live events</h2>
 <p class="small">Event password for opening an event from the game: ${process.env.EVENT_HOST_KEY && process.env.EVENT_HOST_KEY.length >= 8 ? 'ready (EVENT_HOST_KEY)' : 'NOT SET - add EVENT_HOST_KEY on Render or events can\'t open'}</p>
 <table>${allEvents().map(e => `<tr><td><b>${escapeHtml(e.name)}</b><br><span class="small">${escapeHtml(e.artist)} &middot; id ${escapeHtml(cleanId(e.id))} &middot; ${escapeHtml(e.when || '')}</span></td>

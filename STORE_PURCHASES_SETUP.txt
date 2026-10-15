@@ -47,7 +47,7 @@ STEP 2 - GOOGLE PLAY
 10. Google Cloud > Pub/Sub > Topics > "Create topic" ("play-notifications"). Open it > Permissions >
     "Add principal": google-play-developer-notifications@system.gserviceaccount.com, role "Pub/Sub Publisher".
 11. In the topic: "Create subscription" > Delivery type "Push" > Endpoint:
-    https://server.newmoonsamedark.com/store/google/rtdn?secret=(your password) > "Create".
+    https://nmsd.onrender.com/store/google/rtdn?secret=(your password) > "Create".
 12. Play Console > your app > Monetize > Monetization setup > Real-time developer notifications:
     paste the topic name (projects/.../topics/play-notifications) > "Send test notification" > Save.
  TEST WITHOUT REAL MONEY:
@@ -63,7 +63,7 @@ STEP 3 - APPLE APP STORE
  4. Add APPLE_ALLOW_SANDBOX = 1 and KEEP it: Apple's reviewers buy in the free "sandbox".
     Sandbox purchases are marked TEST on /admin, and one button takes them all back.
  5. REFUNDS BY THEMSELVES: your app > App Information > App Store Server Notifications: Production
-    AND Sandbox URL = https://server.newmoonsamedark.com/store/apple/notify  Version 2. Save.
+    AND Sandbox URL = https://nmsd.onrender.com/store/apple/notify  Version 2. Save.
  TEST WITHOUT REAL MONEY:
  6. Users and Access > Sandbox > Testers > "+": make a test Apple account.
  7. iPhone: Settings > App Store > Sandbox Account: sign in with it. Buy in the TestFlight build
