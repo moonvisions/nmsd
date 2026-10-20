@@ -15,7 +15,8 @@ STEP 1 - PUT THESE FILES ON GITHUB
  5. On the next page click the link "uploading an existing file".
  6. Drag in these files from this folder:  package.json  relay.js  payments.js  community.js
     leaderboards.js  store.js  storeverify.js  reports.js  patchbay.js  worlds.js  applications.js
-    and vendors.json   (Round 69: storeverify.js checks Steam / Google Play / App Store purchases -
+    analytics.js  players.js  sellers.js  privacy.html  and vendors.json
+    (Round 85: relay.js needs players.js and sellers.js at start - without them the server won't start)   (Round 69: storeverify.js checks Steam / Google Play / App Store purchases -
     see STORE_PURCHASES_SETUP.txt)
     (NOT the node_modules folder, and NEVER tickets.json - codes are secret)
  7. Click the green "Commit changes" button.
@@ -572,12 +573,27 @@ STEP 2 - ADD A DJ
 
 STEP 3 - WHAT STREAM LINK TO ASK DJs FOR
  The game needs a PUBLIC link that starts with https:// and plays the stream itself (not a web page with
- a player on it). Two kinds work:
+ a player on it). Three kinds work:
+  - TWITCH (Round 75): the DJ's channel link, like https://twitch.tv/theirname. The server asks Twitch
+    for the channel's HLS playlist when the DJ goes live and sends THAT to players (renewed every 15
+    minutes while they're on). Easiest for DJs who already stream to Twitch.
   - AUDIO (works on every device, the most reliable): an internet-radio link, usually ending in .mp3,
     .aac or .ogg (sometimes just /live or /stream). This is what an "Icecast" or "Shoutcast" server gives.
+    NOT .opus - the game can't play Opus, and the page says so if someone pastes one.
   - VIDEO: an HLS link ending in .m3u8 (live video), or an .mp4 file. Video shows on the stage screens.
-    HLS plays on phones, tablets and in web browsers; some computers can't play it, so ask video DJs for
-    an audio link too and put it in "Backup stream link".
+    HLS (Twitch included) plays on phones, tablets, Macs and in web browsers; some Windows PCs can't play
+    it, so ask video/Twitch DJs for an audio link too and put it in "Backup stream link".
+
+ HOW TO GET A STREAM LINK (the same three options are printed on the DJ's own page and on the DJ form,
+ so you can just point a DJ at their page):
+  (a) Twitch (easiest): paste your channel link, e.g. https://twitch.tv/yourname - go live in OBS or your
+      DJ software to Twitch as usual. Works best on phones and Macs; some Windows PCs can't play Twitch's
+      HLS, so add a backup link too.
+  (b) Audio only, most reliable everywhere: stream MP3 or AAC to an Icecast server with BUTT (free) or
+      Mixxx - your host gives you a link like https://host:8000/live. Paste that.
+  (c) Your own RTMP (OBS -> a video service): services like AWS IVS or Cloudflare Stream give you an RTMP
+      address for OBS and a playback .m3u8 link - paste the .m3u8 link here. (Our game server can't take
+      RTMP directly: Render only passes web traffic.)
  How a DJ gets an AUDIO link (generic steps - any Icecast host works, including free ones and your own):
   1. They get an Icecast (internet radio) server: an internet-radio hosting service, or their own Icecast
      server on a computer or cheap web server. It gives them: a server address, a port, a "mount" name
@@ -596,7 +612,14 @@ STEP 3 - WHAT STREAM LINK TO ASK DJs FOR
   3. They press "Start Streaming". The service shows the public playback link ending in .m3u8.
  Check any link: press "Test stream" on the DJ's card (or paste it into "Test any stream link") WHILE
  they're streaming. "WORKING" means players can hear it. The page tells you in plain words what's wrong
- if not (not streaming yet, wrong link, a web page instead of the stream, a home address...).
+ if not (not streaming yet, wrong link, a web page instead of the stream, a home address...). For a
+ Twitch link the test says "Twitch is live - HLS playlist found" or why not ("isn't live right now",
+ "Couldn't reach Twitch - try again in a minute"...).
+ Twitch, good to know: the Twitch link is what's saved; players never see it - they get the playlist
+ address with "via":"twitch" on the stage line. While the server is still asking Twitch (or Twitch isn't
+ answering) players get the backup link instead, or "connecting" if there is none, and it tries again
+ every minute. If Twitch ever changes how its player gets playlists, the test will say so - use option
+ (b) or (c) that night.
 
 STEP 4 - PATCH A DJ ONTO A STAGE
  The page lists every live event, every public (listed) room, and any private room you ask for:
@@ -836,6 +859,17 @@ KEEPING ACCOUNTS FOREVER - DO AT LEAST ONE OF THESE (both is best)
 
  C. Now and then (monthly is fine): /admin/players > "Download full backup" and keep the file safe.
 
+SAVED GAMES FOLLOW THE ACCOUNT (Round 75 - progress sync)
+ The game now keeps a copy of each signed-in player's progress (level, missions, bag, friends, role...) on
+ this server, so a player who reinstalls or changes phones gets it back by signing in. Nothing to set up:
+ it's stored inside the same accounts file and GitHub backup as the account itself (A / B above keep it).
+ On /admin/players each row says "synced 3 min ago" and the CSV has last_sync and role columns.
+ For the curious (the game does this by itself, with the player's sign-in token):
+   GET  /players/progress   -> {ok:true, stamp, social, progress, role}   (stamp 0 and "" until the first sync)
+   POST /players/progress   {stamp, social, progress, role} -> {ok:true, stamp}
+        - at most 96 KB; one write every 15 seconds per account ("slow down"); if the server already has a
+          NEWER copy it answers {ok:false, stale:true, ...the newer copy} and the game picks.
+
 SETTINGS (Render > nmsd > Environment)
  - ADMIN_KEY             your admin password (already set - only ever here, never in a GitHub file).
  - STORE_DATA_DIR        the disk (A above).
@@ -852,3 +886,61 @@ GOOD TO KNOW
  - The Terms of Service and Privacy Policy are a solid generic starting point written for Moon Vision
    Media LLC - have a lawyer look them over when you can (especially the arbitration section and which
    state's law applies).
+
+
+==========================================================================================================
+REAL SHOPS (Round 85) - sellers show their REAL products at their booth, "Buy" opens their own store
+==========================================================================================================
+
+WHAT PLAYERS SEE
+ - Crafters, painters, jewellery makers and clothing sellers (anyone with an Etsy / Shopify / Big Cartel shop
+   or their own website) open Menu > More > "Sell your products (real shop)" at the Open Festival.
+ - They fill in: shop name, what they sell, their store link, a few lines about them, and up to 8 products
+   (name, price like "$24", a picture link, the product's page). They pay the listing fee on Stripe's page,
+   and you approve it. Then their shop shows at the Open Festival:
+     - while they're online and have set up their Vendor Row booth: their booth shows their product photos,
+       and anyone at the counter can open "See their real shop". If they play the Vendor role and stand at
+       their booth, a "LIVE: the owner is here" badge shows so people come and meet them.
+     - while they're offline: up to 6 "REAL SHOP" market stalls at the far end of Vendor Row show them.
+   Walk up, press E: the shop card with the real photos, names and prices, and "Buy on their store" - which
+   opens the seller's own page in the browser. Buying, money and shipping all happen on THEIR store, never in
+   the game. The listing fee is the only payment that comes to you.
+
+SET UP THE FEE (once, about 5 minutes)
+ 1. Stripe dashboard > Product catalog > + Add product.
+      Name: Real shop listing (30 days)      Price: e.g. 9.99 USD      choose ONE-TIME (not recurring)
+    Save. Open the price and COPY its ID (starts with price_...).
+ 2. Render > nmsd > Environment > Add, then Save (it redeploys):
+      SELLER_LISTING_PRICE_ID   = the price_... you copied
+      SELLER_LISTING_DAYS       = 30          (optional - how many days one payment buys; 30 if not set)
+    STRIPE_SECRET_KEY, PUBLIC_URL and ADMIN_KEY are the same ones you already have. No new webhook needed:
+    the server asks Stripe itself whether a listing was paid.
+ 3. Open https://nmsd.onrender.com/admin/sellers - it says "Online payment: ON - $9.99 for 30 days".
+ Without SELLER_LISTING_PRICE_ID, listings just say "waiting for payment" and you press "Mark paid" yourself
+ (if a seller paid you some other way).
+ Keep listings safe: the Render disk (STORE_DATA_DIR, see LIVE ACCOUNTS above) keeps sellers.json for good.
+ A free server forgets listings on every redeploy - add the disk before taking real money.
+
+YOUR ADMIN PAGE - https://nmsd.onrender.com/admin/sellers (or the "Review shops" button on /admin)
+ - Groups: Paid - waiting for you / Live now / Waiting for payment / Expired / Declined.
+ - Each shop: who sent it (username and their account email - only you see it), the store link, the products
+   with their pictures (check them!), and the paid-until date.
+ - Approve / Decline, with a note the seller sees in the game. A shop shows only when it's APPROVED and PAID.
+ - Mark paid (days)  - adds that many days (for a payment made another way, or a free month).
+ - Set end date      - change when it ends. "Not paid" hides it until it's paid again.
+ - Edit / remove     - under each product: fix a name, price or link, or take a product off.
+ - Delete            - removes the listing for good.
+ - Declined something already paid? Refund it in Stripe > Payments.
+ - When a seller changes their listing, it comes back to "waiting for you" (their paid days are kept).
+
+FOR THE CURIOUS (what the game sends; the seller is signed in with their live account)
+   POST /sellers/apply     {shopName, kind: crafts|art|jewelry|clothing|other, storeUrl, about, products:[{title, price,
+                            imageUrl, productUrl}]}  -> the same answer as /sellers/mine
+   GET  /sellers/mine      -> {ok, has, status: payment|review|live|expired|declined, note, paidUntil, liveUntil, fee,
+                               payOnline, days, listing}
+   POST /sellers/checkout  -> {ok, url} (Stripe's page)  or {ok:false, manual:true, error}
+   POST /sellers/remove    -> {ok}
+   GET  /sellers/listings  -> {ok, now, listings:[{id, seller, shopName, kind, about, storeUrl, products}]}  (live only)
+ Links must be https:// and public addresses; pictures must end in .jpg or .png (the game cannot show .webp - the
+ game can't draw WebP and shows a picture glyph instead). Up to 8 products / 8 pictures a shop.
+ File on the disk: sellers.json (and sellers.json.bak, the version before).

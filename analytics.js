@@ -16,8 +16,14 @@
 //  - analytics.json in STORE_DATA_DIR (the permanent disk) - with analytics.json.bak, the version before. Without a
 //    disk it's kept next to the code and starts from zero whenever the free server restarts (the page says so).
 //
-// LIMITS: 32 KB a request, 90 requests a minute from one address, 40 a minute per install; 200,000 installs;
-// 400 active days remembered per install; 300 different errors; 200 different mini-games.
+// LIMITS: 32 KB a request, 600 requests a minute from one address (a venue's Wi-Fi shares one), 40 a minute per
+// install; 200,000 installs; 400 active days remembered per install; 300 different errors; 200 different activity ids.
+//
+// Round 75: "activity" events aren't only mini-games any more - the game also sends level_up, mission_done, bag_open,
+// role_goer / role_dj / role_vendor / role_medic / role_security / role_crew, stream_fail, voice_on, openmic, apply_sent,
+// sync_pull, sync_push (plus unlock_* and legend_*). Each id is counted all-time (acts) AND per day (days[].a), so the
+// dashboard's "Progress & live" panel can show the last 7 days. The server itself counts dj_live / dj_stop the same way
+// (noteActivity - the patch bay calls it when a DJ goes live or stops).
 
 const fs = require('fs');
 const path = require('path');
@@ -68,7 +74,11 @@ function repair() {
   state.fest.grades = dict(state.fest.grades);
   for (const k in state.acts) if (typeof state.acts[k] !== 'number') delete state.acts[k];
   for (const e of Object.values(state.errors)) e.v = dict(e.v);
-  for (const d of Object.values(state.days)) d.e = dict(d.e);
+  for (const d of Object.values(state.days)) {
+    d.e = dict(d.e);
+    d.a = dict(d.a);   // Round 75: that day's activity counts by id
+    for (const k in d.a) if (typeof d.a[k] !== 'number') delete d.a[k];
+  }
   for (const p of Object.values(state.installs)) { p.fl = dict(p.fl); if (p.ers) p.ers = dict(p.ers); if (!Array.isArray(p.ad)) p.ad = []; }
   installCount = Object.keys(state.installs).length;
 }
@@ -166,7 +176,7 @@ function day(ms) {
   const key = dayKey(ms);
   let d = state.days[key];
   if (!d) {
-    d = state.days[key] = { n: 0, s: 0, m: 0, pk: 0, e: dict() };
+    d = state.days[key] = { n: 0, s: 0, m: 0, pk: 0, e: dict(), a: dict() };
     // Old summaries go (a day at a time, so this is cheap).
     const cutoff = dayKey(ms - KEEP_DAYS * DAY);
     for (const k of Object.keys(state.days)) if (k < cutoff) delete state.days[k];
@@ -273,6 +283,29 @@ function onBeat(b, now) {
   save();
 }
 
+/** One activity id, all-time and for the day <d> (new ids are only taken in while there's room: MAX_ACTIVITIES of them). */
+function countActivity(id, d) {
+  if (!id) return;
+  if (state.acts[id] == null && Object.keys(state.acts).length >= MAX_ACTIVITIES) return;
+  state.acts[id] = (state.acts[id] || 0) + 1;
+  if (!d.a) d.a = dict();
+  if (d.a[id] == null && Object.keys(d.a).length >= MAX_ACTIVITIES) return;
+  d.a[id] = (d.a[id] || 0) + 1;
+}
+
+/**
+ * Round 75: the server counts something itself (the patch bay: "dj_live", "dj_stop") - exactly as if a game had sent
+ * {n:"activity", a:{id}}, except there's no install behind it, so no player's record changes.
+ */
+function noteActivity(id) {
+  id = word(id, 24);
+  if (!id) return;
+  const d = day(Date.now());
+  d.e.activity = (d.e.activity || 0) + 1;
+  countActivity(id, d);
+  save();
+}
+
 function onEvents(b, now) {
   const p = install(b.iid, now);
   if (!p) return;
@@ -310,13 +343,7 @@ function onEvents(b, now) {
       case 'tier': if (a.title) p.t = str(a.title, 30); break;
       case 'purchase': p.fl.buy = 1; p.buys = (p.buys || 0) + 1; break;
       case 'signup': if (a.acct) p.a = str(a.acct, 24); break;
-      case 'activity': {
-        const id = word(a.id, 24);
-        if (!id) break;
-        if (state.acts[id] == null && Object.keys(state.acts).length >= MAX_ACTIVITIES) break;
-        state.acts[id] = (state.acts[id] || 0) + 1;
-        break;
-      }
+      case 'activity': countActivity(word(a.id, 24), d); break;
       case 'error': {
         const msg = str(a.msg, 200);
         if (!msg) break;
@@ -483,14 +510,16 @@ function compute() {
   }
 
   const events30 = dict();
+  const acts7 = dict();   // Round 75: activity ids in the last 7 days
   for (const s of series) {
     const d = state.days[s.key];
     if (!d) continue;
     for (const [k, v] of Object.entries(d.e || {})) events30[k] = (events30[k] || 0) + v;
+    if (s.key >= dayKey(now - 6 * DAY)) for (const [k, v] of Object.entries(d.a || {})) acts7[k] = (acts7[k] || 0) + v;
   }
 
   return {
-    now, total, dau, wau, mau, sessions, minutes, foot, platforms, versions, langs, devices, stores, funnel, series, events30,
+    now, total, dau, wau, mau, sessions, minutes, foot, platforms, versions, langs, devices, stores, funnel, series, events30, acts7,
     cohorts: [...cohorts.entries()].sort((a, b) => b[0] - a[0]).slice(0, 14),
     d1: avg(1, 'd1'), d7: avg(7, 'd7'), d30: avg(30, 'd30'),
     money: shop, revenue, revenue30, playerRevenue, payers: payers.size, byVia,
@@ -552,7 +581,31 @@ const EVENT_NAMES = {
   purchase: 'Bought something', error: 'Error / crash', quit: 'Closed the game', signup: 'Made an account', guide: 'Guide step', other: 'Other'
 };
 
+// Round 75: the "Progress & live" panel - what the game reports about progress, roles, streams and syncing (and the two the
+// server counts itself). Shown in this order, with any other activity id that matches these families after them.
+const PROGRESS_IDS = [
+  ['level_up', 'Levelled up'], ['mission_done', 'Mission finished'], ['bag_open', 'Opened the bag'],
+  ['role_goer', 'Role: festival goer'], ['role_dj', 'Role: DJ'], ['role_vendor', 'Role: vendor'], ['role_medic', 'Role: medic'],
+  ['role_security', 'Role: security'], ['role_crew', 'Role: crew'],
+  ['stream_fail', 'A DJ stream failed to play'], ['voice_on', 'Turned voice chat on'], ['openmic', 'Open mic'],
+  ['apply_sent', 'Sent an artist application'], ['sync_pull', 'Saved game pulled from the server'], ['sync_push', 'Saved game pushed to the server'],
+  ['dj_live', 'DJ went live (patch bay)'], ['dj_stop', 'DJ set ended (patch bay)']
+];
+
 function tile(value, label, cls) { return `<div class="tile${cls ? ' ' + cls : ''}"><b>${h(value)}</b><span>${h(label)}</span></div>`; }
+
+function progressTable(acts7) {
+  const known = new Set(PROGRESS_IDS.map(([id]) => id));
+  const rows = PROGRESS_IDS.map(([id, label]) => [id, label]);
+  for (const id of Object.keys(state.acts).sort()) {
+    if (!known.has(id) && /^(unlock_|legend_|role_|sync_)/.test(id)) rows.push([id, id]);
+  }
+  const any = rows.some(([id]) => state.acts[id] || acts7[id]);
+  if (!any) return '<p class="muted small">Nothing yet - these appear once players run a game version that reports them.</p>';
+  return `<table class="list"><tr><th>What</th><th>Last 7 days</th><th>All time</th></tr>${rows.map(([id, label]) =>
+    `<tr><td>${h(label)}<br><span class="small muted">${h(id)}</span></td><td>${fmt(acts7[id] || 0)}</td><td>${fmt(state.acts[id] || 0)}</td></tr>`).join('')}</table>
+<p class="small muted">"Last 7 days" counts from the per-day tally kept since this update; "All time" is the total since counting began.</p>`;
+}
 
 function barTable(obj, limit, format) {
   const rows = Object.entries(obj).sort((a, b) => b[1] - a[1]).slice(0, limit || 12);
@@ -666,6 +719,9 @@ function dashboard(key, q) {
   parts.push(`<div><h2>What happened (last 30 days)</h2>${barTable(named, 15)}</div>`);
   parts.push(`<div><h2>Festivals finished</h2><div class="grid">${tile(fmt(f.n), 'festivals finished')}${tile(f.n ? fmt(f.att / f.n) : '–', 'average crowd')}${tile(f.n ? money(f.profit / f.n * 100) : '–', 'average profit (game $)')}${tile(f.n ? Math.round(f.sat / f.n) + '%' : '–', 'average happiness')}</div>${barTable(f.grades)}</div>`);
   parts.push('</div>');
+
+  // Round 75: progress, roles, streams, syncing - and the patch bay's DJ sets
+  parts.push(`<h2>Progress &amp; live</h2>${progressTable(c.acts7)}`);
 
   // Money
   parts.push('<h2>Money</h2>');
@@ -788,4 +844,4 @@ function adminSection(hiddenKey) {
 <form method="post" action="/admin/stats">${hiddenKey}<button type="submit">Open play stats</button></form>`;
 }
 
-module.exports = { handle, attach, flush, adminSection, _test: { state: () => state, compute, dashboard, onStart, onBeat, onEvents, live } };
+module.exports = { handle, attach, flush, adminSection, noteActivity, _test: { state: () => state, compute, dashboard, onStart, onBeat, onEvents, live } };

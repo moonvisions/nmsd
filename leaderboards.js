@@ -111,6 +111,11 @@ dropOldWeeks(weekOf(Date.now()));
 let secretIsNew = false;
 if (process.env.BOARD_SECRET && process.env.BOARD_SECRET.length >= 16) secret = process.env.BOARD_SECRET;
 else if (!secret) { secret = crypto.randomBytes(32).toString('hex'); secretIsNew = true; }
+// Round 93: without BOARD_SECRET the secret lives only in this server's runtime file (never in git) - say so clearly.
+if (!(process.env.BOARD_SECRET && process.env.BOARD_SECRET.length >= 16)) {
+  console.warn('leaderboards: WARNING - BOARD_SECRET is not set. A random secret is being kept in ' + path.basename(FILE) + ' on this server only; ' +
+    'if that file is lost, everyone\'s leaderboard tokens stop working. Set BOARD_SECRET (32+ random characters) in Render > Environment.');
+}
 
 function dropOldWeeks(now) {
   for (const w of Object.keys(data.weeks)) if (Number(w) < now - 1) delete data.weeks[w];   // this week and last week only

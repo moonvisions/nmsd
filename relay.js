@@ -73,7 +73,7 @@
 //   to everyone else:   {"relay":"newlead","old":<promoted player's old guest id>,"name":"<their name>","prev":"<old lead's name>"}
 // Everyone in the room hears the clock and the head count from the relay itself:
 //   on arrival:         {"relay":"pub","id":<my id, 0 = lead>,"name":"..","lead":bool,"players":n,"capacity":n,"now":ms,"epoch":ms,"dayLen":s,"seed":n}
-//   joins and leaves:   {"relay":"count","players":n,"now":ms} (and every 30 s); a guest leaving: {"relay":"left","g":id,"name":".."}
+//   joins and leaves:   {"relay":"count","players":n,"now":ms} (and every 10 s - Round 93); a guest leaving: {"relay":"left","g":id,"name":".."}
 //   server restarting:  {"relay":"restart","text":".."} (the game reconnects by itself)
 // A player says which role they're playing with {"relay":"role","id":"medic"} (goer, dj, vendor, medic, security, crew).
 // Presence ("where I am") lines are passed straight from each player to the others by the relay (from/name stamped
@@ -189,6 +189,7 @@ const worlds = require('./worlds');               // Round 63: saved worlds
 const applications = require('./applications');   // Round 67: artists applying to play the Open Festival (/apply)
 const analytics = require('./analytics');   // Round 71: play stats (/stats/*, /admin/stats)
 const players = require('./players');       // Round 74: live sign-up - a username and email for the Open Festival (/players/*, /admin/players)
+const sellers = require('./sellers');       // Round 85: real shops - sellers' real products at their booths (/sellers/*, /admin/sellers)
 const crypto = require('crypto');
 const eventRooms = new Map();      // Round 50: live event id -> its room code
 payments.setLiveEvents(eventRooms);
@@ -594,7 +595,7 @@ function relayVoice(room, from, sender, data) {
   const audio = text.slice(colon + 1);
   if (!audio || !/^[A-Za-z0-9+/=]+$/.test(audio)) return;
   const line = 'v:' + from + ':' + audio;
-  const deliver = (ws) => { if (ws && ws !== sender && ws.readyState === 1 && ws.bufferedAmount < VOICE_BACKLOG) ws.send(line); };
+  const deliver = (ws) => { if (ws && ws !== sender && ws.readyState === 1 && ws.bufferedAmount < VOICE_BACKLOG && voiceNear(room, sender, ws)) ws.send(line); };   // Round 93: + near the talker (public festival)
   if (to === '') {
     if (from !== 0) deliver(room.host);
     for (const guest of room.guests.values()) deliver(guest);
@@ -656,7 +657,7 @@ const PUBLIC_DAY_SECONDS = Math.max(60, Math.min(86400, Number(process.env.PUBLI
 const PUBLIC_EPOCH = Date.UTC(2026, 0, 1);     // day 0 of the public festival's clock (never change it: everyone's seed follows it)
 const PUBLIC_SEED_STEP = 7919, PUBLIC_SEED_BASE = 58058;   // seed = day index * step + base (the game does the same sum)
 const PUBLIC_ROLES = ['goer', 'dj', 'vendor', 'medic', 'security', 'crew'];
-const PUBLIC_COUNT_EVERY = 30000;       // the head count (and the clock) to everyone this often, and on every join and leave
+const PUBLIC_COUNT_EVERY = 10000;       // the head count (and the clock) to everyone this often, and on every join and leave (Round 93: was 30 s - it doubles as the games' "still connected" signal)
 const PUBLIC_LEAD_SILENT_MS = Number(process.env.PUBLIC_LEAD_SILENT_MS) || 8000;   // a lead this quiet (a live game sends 10 a second) is let go
 const PUBLIC_KICK_GRACE = 30000;        // the lead may turn a newcomer away (a different game version) only this soon after they arrive
 const PUBLIC_BAN_MS = 3600000;          // removed after reports: kept out of the public festival this long
@@ -664,11 +665,33 @@ const PUBLIC_NEAR = 45;                 // metres: players this close get each o
 const PUBLIC_FAR_MS = 2000;             // everyone else gets a player's step this often
 const PUBLIC_ROUTE_ABOVE = 20;          // players in the room above which steps go only to the people near each other
 const MAX_PUBLIC_PRESENCE = 8192;       // characters in one step (an outfit can be up to 4000)
-const PRESENCE_RATE = 20, PRESENCE_BURST = 30;   // steps a second a player may send (a game sends 7-10)
+const PRESENCE_RATE = 14, PRESENCE_BURST = 24;   // steps a second a player may send (a game sends 7-10; Round 93: 2 standing still). Round 93: was 20 / 30
 const PUBLIC_PER_IP = Math.max(1, Number(process.env.PUBLIC_PER_IP) || 3);   // Round 66 (review): players from one address
 const PUBLIC_LEAD_GRACE = 30000;        // Round 66 (review): a new lead isn't let go for being quiet this soon (its game may still be loading)
 const LEAD_MSG_RATE = 400, LEAD_MSG_BURST = 800;                    // Round 66 (review): the lead's lines a second (its own + the guests' it passes on)
 const LEAD_BYTE_RATE = 512 * 1024, LEAD_BYTE_BURST = 2 * 1024 * 1024;
+// Round 93: live multiplayer health.
+//  - FAN-OUT: a guest's "custom" and "social" lines (the shared games' channels) go from here straight to everyone else, with
+//    who sent them and their name stamped by the relay - not up to the lead and back down again. The lead still gets each one
+//    (wrapped as before) to act on, but no longer passes it on, so its upload stays small however full the festival is, and
+//    nobody (a modified lead included) can put words in another player's mouth on those channels. "pub" says "fan":1; a lead
+//    whose game doesn't know yet passes them on as before and those copies are skipped here (nobody gets one twice).
+//    The open mic's channels (omic, omicr) still go through the lead, which checks every one first.
+//  - A player whose connection dropped and comes back (same live account) replaces their old, dead connection at once:
+//    the same name, no ghost standing about for a minute. A guest silent this long (a game sends 7-10 steps a second) is let go.
+//  - Different game versions: a newcomer whose game speaks another protocol version (?v=) than the lead's is turned away here,
+//    before anyone sees them, with words that say which side needs updating. Games that don't say their version: as before.
+//  - Voice in the public festival only reaches players within PUBLIC_VOICE_RANGE of the talker (by their last steps) - a
+//    modified game can't talk into everyone's ears across the site.
+//  - The lead's own lines may only speak for the lead: a "from" other than 0 (or -1) on a game line it sends is dropped,
+//    except a line it passes on for that very guest ("except": that guest).
+const PUBLIC_GUEST_SILENT_MS = Number(process.env.PUBLIC_GUEST_SILENT_MS) || 75000;   // (review: 75 s - a phone in a pocket or a hidden browser tab sends nothing for a while, and pings don't count)
+const PUBLIC_VOICE_RANGE = 60;          // metres (the game's voice is silent beyond 25 m; steps can be a moment old)
+const FAN_MAX = 4096;                   // characters in one fanned-out line (custom payloads are at most 1200)
+const FAN_RATE = 40, FAN_BURST = 60;    // custom/social lines a second per player (the game sends at most 20 a channel, a few channels at once)
+const FAN_SOCIAL_RATE = 5, FAN_SOCIAL_BURST = 10;   // social lines (records, dance-offs...) a second per player, within the above
+const FAN_CUSTOM_TEXT = 1200, FAN_SOCIAL_TEXT = 64, FAN_CHANNEL = 24;
+const FAN_LEAD_ONLY = new Set(['omic', 'omicr']);   // custom channels the lead still checks and passes on itself
 // Round 66 (review): what the lead may never send in the public festival - it is just another player, not a host. (A "bye" is
 // allowed only to one newcomer, straight after they arrive: the lead's game turns away a different version.)
 const PUBLIC_LEAD_BLOCKED = new Set(['bye', 'leave', 'welcome', 'start', 'snapshot', 'state', 'liveset', 'world', 'wsec']);
@@ -727,6 +750,16 @@ function publicNewId(room) {
   return 0;
 }
 
+/** Round 93 (review): would publicNewId find a free number right now (without taking one)? */
+function publicHasFreeId(room) {
+  let id = room.nextId;
+  for (let tries = 0; tries < 2000; tries++) {
+    if (!room.guests.has(id)) return true;
+    id = id >= 900000 ? 1 : id + 1;
+  }
+  return false;
+}
+
 function publicRole(id) {
   const role = String(id || '');
   return PUBLIC_ROLES.includes(role) ? role : '';
@@ -763,6 +796,13 @@ function publicPresence(room, ws, id, text) {
   if (typeof p.gear === 'string' && p.gear.length > 4000) p.gear = '';
   ws.px = Number(p.x) || 0;
   ws.pz = Number(p.z) || 0;
+  // Round 93: a game writes every field of its message, most of them empty in a step ("save":"","relay":"",...). Those go:
+  // a game reading the step gets the same (an empty field reads as its default), and every step is a third smaller.
+  for (const k of Object.keys(p)) {
+    if (k === 't' || k === 'from' || k === 'target') continue;
+    const v = p[k];
+    if (v === '' || v === 0 || v === false || v === null) delete p[k];
+  }
   const line = JSON.stringify(p);
   const now = Date.now();
   const everyone = publicPlayers(room) <= PUBLIC_ROUTE_ABOVE || now - (ws.presFullAt || 0) >= PUBLIC_FAR_MS;
@@ -777,6 +817,101 @@ function publicPresence(room, ws, id, text) {
     }
     other.send(line);
   });
+}
+
+/** Round 93: a player may fan out FAN_RATE custom/social lines a second (bursts up to FAN_BURST); the rest are skipped. */
+function fanAllowed(ws, social) {
+  const now = Date.now();
+  if (social) {
+    if (ws.socTokens === undefined) { ws.socTokens = FAN_SOCIAL_BURST; ws.socAt = now; }
+    ws.socTokens = Math.min(FAN_SOCIAL_BURST, ws.socTokens + (now - ws.socAt) * FAN_SOCIAL_RATE / 1000);
+    ws.socAt = now;
+    if (ws.socTokens < 1) return false;
+  }
+  if (ws.fanTokens === undefined) { ws.fanTokens = FAN_BURST; ws.fanAt = now; }
+  ws.fanTokens = Math.min(FAN_BURST, ws.fanTokens + (now - ws.fanAt) * FAN_RATE / 1000);
+  ws.fanAt = now;
+  if (ws.fanTokens < 1) return false;
+  ws.fanTokens -= 1;
+  if (social) ws.socTokens -= 1;
+  return true;
+}
+
+/**
+ * Round 93: a game line the relay fans out itself (a custom line on any channel but the open mic's, or a social line), checked
+ * the way the lead's game checks it. Returns the parsed message, or null (not one of these, or not acceptable).
+ */
+function fanParse(text) {
+  if (text.length > FAN_MAX) return null;
+  let p;
+  try { p = JSON.parse(text); } catch { return null; }
+  if (!p || typeof p !== 'object' || Array.isArray(p)) return null;
+  if (p.t === 'custom') {
+    if (typeof p.ch !== 'string' || p.ch.length < 1 || p.ch.length > FAN_CHANNEL || FAN_LEAD_ONLY.has(p.ch)) return null;
+    if (p.text !== undefined && p.text !== null && (typeof p.text !== 'string' || p.text.length > FAN_CUSTOM_TEXT)) return null;
+    return p;
+  }
+  if (p.t === 'social') {
+    if (p.text !== undefined && p.text !== null && (typeof p.text !== 'string' || p.text.length > FAN_SOCIAL_TEXT)) return null;
+    if (p.target !== undefined && !Number.isInteger(p.target)) return null;
+    return p;
+  }
+  return null;
+}
+
+/** Round 93: is this a line the relay fans out (so the lead must not pass it on again)? ('' kind: not a game line.) */
+function fanKind(kind, text) {
+  if (kind === 'social') return true;
+  if (kind !== 'custom') return false;
+  const m = /"ch":"([^"\\]{0,24})"/.exec(text);
+  return !!m && m[1].length > 0 && !FAN_LEAD_ONLY.has(m[1]);
+}
+
+/** Round 93: a guest's custom/social line - to the lead (to act on, as before) and straight to everyone else (stamped). */
+function publicFanOut(room, ws, id, text) {
+  const p = fanParse(text);
+  if (!p) {
+    // Not one the relay fans out: an open-mic line goes to the lead as before; anything malformed goes nowhere.
+    if (lineKind(text) === 'custom' && !fanKind('custom', text)) { sendToHost(room, JSON.stringify({ relay: 'msg', g: id, m: text })); }
+    return;
+  }
+  if (!fanAllowed(ws, p.t === 'social')) return;
+  sendToHost(room, JSON.stringify({ relay: 'msg', g: id, m: text }));
+  p.from = id;
+  p.name = ws.pname;
+  const line = JSON.stringify(p);
+  for (const [gid, guest] of room.guests) {
+    if (gid === id || guest === ws || guest.readyState !== 1 || guest.pubGone) continue;
+    if (guest.bufferedAmount > MAX_BUFFERED) continue;   // far behind: skipped (never queued without end)
+    guest.send(line);
+  }
+}
+
+/**
+ * Round 93 (review): a game line the lead sends, parsed: a plain object whose "t" is the kind it starts with (JSON keeps the
+ * LAST of two "t"s - a line can't start as one kind and be read as another) and whose "from", if any, is a whole number.
+ * null if it isn't one.
+ */
+function leadLine(text, kind) {
+  let p;
+  try { p = JSON.parse(text); } catch { return null; }
+  if (!p || typeof p !== 'object' || Array.isArray(p) || p.t !== kind) return null;
+  if (p.from !== undefined && !Number.isInteger(p.from)) return null;
+  return p;
+}
+
+/** Round 93: a parsed line of a kind the relay fans out itself (custom on any channel but the open mic's; social). */
+function fanParsedKind(p) {
+  if (p.t === 'social') return true;
+  return p.t === 'custom' && typeof p.ch === 'string' && p.ch.length > 0 && !FAN_LEAD_ONLY.has(p.ch);
+}
+
+/** Round 93: may this listener hear a voice packet from this talker (public festival: within PUBLIC_VOICE_RANGE)? */
+function voiceNear(room, sender, listener) {
+  if (!room.isPublic) return true;
+  if (sender.px === undefined || listener.px === undefined) return true;   // (positions not known yet: as before)
+  const dx = sender.px - listener.px, dz = sender.pz - listener.pz;
+  return dx * dx + dz * dz <= PUBLIC_VOICE_RANGE * PUBLIC_VOICE_RANGE;
 }
 
 /** Round 66: a report in the public festival (target = the id the reporter sees: 0 = the lead). */
@@ -908,6 +1043,18 @@ function publicLeadMessage(room, ws, data) {
   // out to be a modified game can't send everyone home, or anyone a festival). A goodbye may go to one newcomer only.
   const kind = lineKind(packet.m);
   if (!kind && !packet.m.startsWith('m:')) return;
+  if (kind) {
+    // Round 93 (review): a game line is read in full - its real kind and sender, not just how it starts (a second "t" or a
+    // "from" further along can't slip past) - and passed on as re-written here, so every game reads exactly what was checked.
+    const p = leadLine(packet.m, kind);
+    if (!p) return;
+    // The relay already gave everyone a guest's custom/social line - a lead passing it on again is skipped.
+    if (Number.isInteger(packet.except) && fanParsedKind(p)) return;
+    // The lead speaks only for itself (0; -1 = not set), or passes a line on for the one guest it came from.
+    const from = p.from === undefined ? -1 : p.from;
+    if (from !== 0 && from !== -1 && !(Number.isInteger(packet.except) && from === packet.except && room.guests.has(from))) return;
+    packet.m = JSON.stringify(p);
+  }
   if (PUBLIC_LEAD_BLOCKED.has(kind)) {
     const newcomer = Number.isInteger(packet.to) ? room.guests.get(packet.to) : null;
     if (kind !== 'bye' || !newcomer || Date.now() - (newcomer.joinedAt || 0) >= PUBLIC_KICK_GRACE) return;
@@ -960,6 +1107,7 @@ function publicMessage(room, ws, data) {
     return;
   }
   if (head.startsWith('{"t":"presence"')) { publicPresence(room, ws, id, data.toString()); return; }
+  if (head.startsWith('{"t":"custom"') || head.startsWith('{"t":"social"')) { publicFanOut(room, ws, id, data.toString()); return; }   // Round 93
   sendToHost(room, JSON.stringify({ relay: 'msg', g: id, m: data.toString() }));
 }
 
@@ -969,15 +1117,43 @@ function publicConnect(ws, url, ip) {
   const now = Date.now();
   const refuse = (text) => { send(ws, JSON.stringify({ t: 'bye', from: 0, ch: 'relay', text })); ws.close(1000, 'refused'); };
   if ((publicBans.get(ip) || 0) > now) { refuse('You were removed from the public festival after reports from other players. Try again later.'); return; }
+  // Round 74: live mode needs a sign-up (a username and email) - and everyone there sees that username.
+  if (players.required() && !players.isReady()) { refuse('The server is just starting up - try again in a few seconds.'); return; }
+  const signedUp = players.check(url.searchParams.get('pt') || '');
+  if (!signedUp && players.required()) { refuse('signup: Make a live account (username, email and password) to join the Open Festival. (Update the game if it doesn\'t ask you.)'); return; }
+  // Round 93: the game's protocol version (?v=; 0 = an older game that doesn't say). A different one than the lead's can't
+  // play together - turned away here, before anyone sees them, saying which side needs updating.
+  const pv = /^\d{1,4}$/.test(String(url.searchParams.get('v') || '')) ? Number(url.searchParams.get('v')) : 0;
+  const leadPv = room.host && !room.host.pubGone ? (room.host.pv || 0) : 0;
+  if (pv > 0 && leadPv > 0 && pv !== leadPv) {
+    refuse(pv < leadPv
+      ? 'The Open Festival is on a newer version of the game. Please update your game, then join again.'
+      : 'The current host of the Open Festival is on an older version of the game. Try again in a little while (they update too).');
+    return;
+  }
+  // Round 93: the same live account coming back (a dropped connection, or another device): the old connection goes now,
+  // so they keep their name and nobody sees a frozen ghost of them. (Before the name is picked, so it isn't "Jade 2".)
+  const account = signedUp ? String(signedUp.username || '').toLowerCase() : '';
+  if (account) {
+    // (Round 93 review: only if the festival can take them - the old connection isn't let go for nothing.)
+    if (!publicHasFreeId(room)) { refuse('The public festival is busy - try again in a minute.'); return; }
+    const old = [];
+    publicEach(room, other => { if (other.pubAccount === account && !other.pubGone) old.push(other); });
+    for (const other of old) {
+      send(other, JSON.stringify({ t: 'bye', from: 0, ch: 'relay', text: 'You joined the Open Festival from another device.' }));
+      publicDrop(room, other);
+      // Round 93 (review): its own close code - the game there (lead or not) takes it as final and doesn't reconnect.
+      try { other.close(4001, 'replaced'); } catch { /* gone already */ }
+    }
+  }
+  // (Round 93: counted after a returning player's old connection has gone - it mustn't keep them out.)
   if (publicPlayers(room) >= PUBLIC_CAPACITY) { refuse(`The public festival is full right now (${PUBLIC_CAPACITY} people) - try again in a few minutes.`); return; }
   // Round 66 (review): a few players per address at most - one or two computers can't fill the whole festival.
   let fromHere = 0;
   publicEach(room, other => { if (other.ip === ip && !other.pubGone) fromHere++; });
   if (fromHere >= PUBLIC_PER_IP) { refuse(`Only ${PUBLIC_PER_IP} players from one network can be in the public festival at once.`); return; }
-  // Round 74: live mode needs a sign-up (a username and email) - and everyone there sees that username.
-  if (players.required() && !players.isReady()) { refuse('The server is just starting up - try again in a few seconds.'); return; }
-  const signedUp = players.check(url.searchParams.get('pt') || '');
-  if (!signedUp && players.required()) { refuse('signup: Make a live account (username, email and password) to join the Open Festival. (Update the game if it doesn\'t ask you.)'); return; }
+  ws.pubAccount = account;
+  ws.pv = pv;
   ws.pname = publicName(room, signedUp ? signedUp.username : url.searchParams.get('name'));
   ws.role = 'goer';
   ws.joinedAt = now;
@@ -994,7 +1170,7 @@ function publicConnect(ws, url, ip) {
     room.guests.set(id, ws);
   }
   ws.pubId = id;
-  send(ws, JSON.stringify(Object.assign({ relay: 'pub', id, name: ws.pname, lead, players: publicPlayers(room), capacity: PUBLIC_CAPACITY }, publicClock(now))));
+  send(ws, JSON.stringify(Object.assign({ relay: 'pub', id, name: ws.pname, lead, players: publicPlayers(room), capacity: PUBLIC_CAPACITY }, publicClock(now), { fan: 1 })));   // Round 93: fan = the relay passes guests' custom/social lines on itself
   if (lead) send(ws, JSON.stringify({ relay: 'lead', old: -1 }));
   else send(room.host, JSON.stringify({ relay: 'join', g: id, name: ws.pname }));
   sendPatches(ws, PUBLIC_CODE, room);   // the stages' live DJs straight away
@@ -1051,6 +1227,13 @@ setInterval(() => {
     publicDrop(publicRoom, lead);   // the next lead takes over now
     lead.terminate();
   }
+  // Round 93: a guest gone quiet (a dropped phone signal the pings haven't caught) is let go, so their figure, seat and
+  // holds free up for everyone in seconds rather than a minute. A game coming back reconnects by itself.
+  for (const guest of Array.from(publicRoom.guests.values())) {
+    if (now - (guest.joinedAt || 0) < PUBLIC_LEAD_GRACE || now - (guest.lastMsgAt || 0) <= PUBLIC_GUEST_SILENT_MS) continue;
+    publicDrop(publicRoom, guest);
+    try { guest.terminate(); } catch { /* gone already */ }
+  }
 }, 2000).unref();
 setInterval(() => {
   publicCountAll(publicRoom);
@@ -1103,6 +1286,7 @@ function handleHttp(req, res) {
   if (req.url && leaderboards.handle(req, res)) return;   // Round 55
   if (req.url && worlds.handle(req, res)) return;         // Round 63: saved worlds (/worlds/...)
   if (req.url && applications.handle(req, res)) return;   // Round 67: artist applications (/apply, /apply/status, /admin/applications)
+  if (req.url && sellers.handle(req, res)) return;        // Round 85: real shops (/sellers/apply, /sellers/mine, /sellers/checkout, /sellers/listings, /admin/sellers)
   if (req.url && analytics.handle(req, res)) return;      // Round 71: play stats (/stats/start, /stats/beat, /stats/events, /admin/stats)
   if (req.url && players.handle(req, res)) return;        // Round 74: live sign-up (/players/signup, /players/signin, /players/me, /admin/players)
   // Round 33: the Vendor Village list. Edit vendors.json (on GitHub) and the game picks it up.
@@ -1545,6 +1729,7 @@ for (const signal of ['SIGTERM', 'SIGINT']) {
     try { publicEach(publicRoom, ws => send(ws, restart)); } catch (err) { console.error('restart notice', err && err.message); }
     leaderboards.flush(); reports.flush(); patchbay.flush(); worlds.flush();   // Round 60: + the patch bay. Round 63: + saved worlds
     applications.flush();   // Round 67: + artist applications
+    sellers.flush();        // Round 85: + real shops
     analytics.flush();      // Round 71: + play stats
     // Round 74: + the live accounts (to disk, and the off-site backup if one is waiting - up to 6 s).
     const accounts = Promise.race([players.final().catch(err => console.error('players final', err && err.message)), new Promise(r => setTimeout(r, 6000))]);

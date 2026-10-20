@@ -15,12 +15,25 @@
 //   POST /players/password  Bearer + {password, newPassword}                            -> {ok, token}
 //   POST /players/agree     Bearer + {terms}                                            -> {ok}   (new terms accepted)
 //   POST /players/delete    Bearer + {password}                                         -> {ok}   (the player deletes their account)
+//   GET  /players/progress  Bearer                       -> {ok, stamp, social, progress, role}   (Round 75: the player's saved game,
+//                                                           kept with their account so it follows them to any device; all 0 / "" until
+//                                                           the game has sent one)
+//   POST /players/progress  Bearer + {stamp (ms since epoch), social (JSON string), progress (JSON string), role (<=16 chars)}
+//                                                        -> {ok, stamp}. The server never reads inside social / progress - they're the
+//                                                           game's own text. If what's stored is NEWER than the stamp sent, nothing is
+//                                                           written and the answer is {ok:false, stale:true, stamp, social, progress, role}
+//                                                           (the game decides what to keep). At most 96 KB a body (413 "too big"), and one
+//                                                           write every 15 s per account (429 "slow down"). No sign-in -> 401 "sign in".
 //   GET  /terms, /privacy   the Terms of Service and the Privacy Policy (the game links to them)
 //   GET/POST /admin/players (admin password): every account - username, email, joined, last seen, terms - search, reset a
 //                           password, delete, download CSV, download / restore a full backup.
 //
 // PASSWORDS are never stored: only a salted scrypt hash (not even the admin can see one; the admin can set a new one).
 // Device tokens are stored hashed too.
+//
+// Round 75: each account also carries the player's SAVED GAME (p.progress = {stamp, social, progress, role, at}) - it rides
+// inside the same players.json / GitHub backup as the account, so every path below (disk, vault, merge, restore) keeps it.
+// When two copies of an account meet (merge), the newer saved game wins by its stamp, whichever account copy is kept.
 //
 // KEEPING ACCOUNTS FOREVER (through every server update / redeploy / restart):
 //   1. players.json in STORE_DATA_DIR - the Render persistent disk (Render > nmsd > Disks; mount path e.g. /var/data and
@@ -47,6 +60,9 @@ const FILE = path.join(DIR, 'players.json');
 const BAK = FILE + '.bak';
 const MAX_PLAYERS = 500000;
 const MAX_TOKENS = 8;
+const MAX_PROGRESS_BODY = 96 * 1024;   // Round 75: one progress sync (both blobs together)
+const MAX_ROLE = 16;
+const PROGRESS_GAP = 15000;            // one progress write per account this often
 const TERMS_VERSION = '2026-10-14';
 const CONTACT = process.env.CONTACT_EMAIL || 'daniel@moonvisionmedia.com';
 const COMPANY = 'Moon Vision Media LLC';
@@ -90,10 +106,12 @@ function newer(a, b) {
 }
 
 /** Marks the accounts changed (written to disk within 3 s). <paramref important> (an account made, changed or deleted - not just
- *  "last seen") also sends the off-site backup soon. */
+ *  "last seen") also sends the off-site backup soon. A number instead: send the backup within that many ms (Round 75: a
+ *  progress sync goes within 30 s - soon enough, without a GitHub commit for every player every 15 s). */
 function save(important = true) {
   dirty = true;
-  if (important) vaultSoon(4000);
+  if (typeof important === 'number') vaultSoon(important);
+  else if (important) vaultSoon(4000);
   else vaultSoon(600000);   // (last-seen times ride along with the next backup, at most every 10 minutes)
 }
 
@@ -312,9 +330,14 @@ function merge(data, quiet) {
     const gone = Date.parse(state.deletedKeys[k] || '') || 0;
     if (gone && gone >= stamp) continue;   // deleted after this copy was made
     const mine = state.players[k];
-    if (mine && (Date.parse(mine.updated || mine.created || '') || 0) >= stamp) continue;
+    if (mine && (Date.parse(mine.updated || mine.created || '') || 0) >= stamp) {
+      // Round 75: my copy of the account stays, but their saved game may still be newer (synced on the other server).
+      if (newerProgress(p.progress, mine.progress)) { mine.progress = p.progress; n++; }
+      continue;
+    }
     const other = byEmail.get(p.email);
     if (other && other !== k) continue;   // that email is someone else's here
+    if (mine && newerProgress(mine.progress, p.progress)) p.progress = mine.progress;   // (their account, my newer saved game)
     state.players[k] = p;
     n++;
   }
@@ -439,6 +462,76 @@ function readJson(req, limit) {
 
 const now = () => new Date().toISOString();
 
+// ------------------------------------------------------------------ Round 75: the player's saved game (progress sync)
+
+/** A stored saved game, or null if it isn't one ({stamp, social, progress, role} - the blobs are the game's own text). */
+function cleanProgress(v) {
+  if (!v || typeof v !== 'object') return null;
+  const stamp = Number(v.stamp);
+  if (!Number.isFinite(stamp) || stamp < 0) return null;
+  return { stamp: Math.floor(stamp), social: typeof v.social === 'string' ? v.social : '', progress: typeof v.progress === 'string' ? v.progress : '', role: String(v.role || '').slice(0, MAX_ROLE), at: v.at || now() };
+}
+
+function newerProgress(a, b) {
+  const pa = cleanProgress(a), pb = cleanProgress(b);
+  return !!pa && (!pb || pa.stamp > pb.stamp);
+}
+
+function progressOf(p) {
+  const s = cleanProgress(p && p.progress);
+  return s ? { stamp: s.stamp, social: s.social, progress: s.progress, role: s.role } : { stamp: 0, social: '', progress: '', role: '' };
+}
+
+/** Reads a JSON body up to <limit> bytes: the parsed object, {} if it isn't JSON, or null when it's too big (so the caller can say 413). */
+function readJsonOrTooBig(req, limit) {
+  return new Promise(resolve => {
+    if (Number(req.headers['content-length']) > limit) { resolve(null); return; }
+    let body = '';
+    let tooBig = false;
+    req.setEncoding('utf8');
+    req.on('data', chunk => {
+      if (tooBig) return;
+      body += chunk;
+      if (body.length > limit) { tooBig = true; body = ''; resolve(null); }
+    });
+    req.on('end', () => { if (tooBig) return; try { resolve(JSON.parse(body || '{}')); } catch { resolve({}); } });
+    req.on('error', () => resolve(tooBig ? null : {}));
+  });
+}
+
+function progressRoute(req, res) {
+  const p = byBearer(req);
+  if (!p) { json(res, 401, { ok: false, error: 'sign in' }); return; }
+  if (req.method === 'GET') { json(res, 200, Object.assign({ ok: true }, progressOf(p))); return; }
+  if (req.method !== 'POST') { json(res, 405, { ok: false, error: 'use GET or POST' }); return; }
+  const key = p.username.toLowerCase();
+  readJsonOrTooBig(req, MAX_PROGRESS_BODY).then(body => {
+    if (body === null) { json(res, 413, { ok: false, error: 'too big' }); setImmediate(() => req.destroy()); return; }
+    const incoming = cleanProgress(body);
+    if (!incoming || !incoming.stamp) { json(res, 400, { ok: false, error: 'stamp (ms since epoch), social, progress and role are needed' }); return; }
+    if (typeof body.social !== 'string' || typeof body.progress !== 'string') { json(res, 400, { ok: false, error: 'social and progress must be strings' }); return; }
+    if (String(body.role || '').length > MAX_ROLE) { json(res, 400, { ok: false, error: 'role is too long' }); return; }
+    const stored = cleanProgress(p.progress);
+    if (stored && stored.stamp > incoming.stamp) { json(res, 200, Object.assign({ ok: false, stale: true }, progressOf(p))); return; }   // (the game decides)
+    if (peek('prog|' + key, 1, PROGRESS_GAP)) { json(res, 429, { ok: false, error: 'slow down' }); return; }
+    limited('prog|' + key, 1, PROGRESS_GAP);
+    p.progress = { stamp: incoming.stamp, social: incoming.social, progress: incoming.progress, role: incoming.role, at: now() };
+    p.seen = now();
+    save(30000);
+    json(res, 200, { ok: true, stamp: incoming.stamp });
+  }).catch(err => {
+    console.error('players progress', err && err.message);
+    json(res, 500, { ok: false, error: 'try again' });
+  });
+}
+
+function ago(iso) {
+  const ms = Date.now() - (Date.parse(iso || '') || 0);
+  if (!iso || !Number.isFinite(ms)) return 'never';
+  const m = Math.round(ms / 60000);
+  return m < 1 ? 'just now' : m < 60 ? `${m} min ago` : m < 48 * 60 ? `${Math.floor(m / 60)} h ago` : `${Math.floor(m / 1440)} days ago`;
+}
+
 // ------------------------------------------------------------------ routes
 
 function handle(req, res) {
@@ -456,6 +549,8 @@ function handle(req, res) {
 
   if (!ready) { json(res, 503, { ok: false, message: 'The server is starting up - try again in a few seconds.' }); return true; }
   const ip = ipOf(req);
+
+  if (route === '/players/progress') { progressRoute(req, res); return true; }   // Round 75 (its own body limit and GET + POST)
 
   if (route === '/players/me') {
     const p = byBearer(req);
@@ -597,7 +692,7 @@ function admin(req, res) {
     const rows = list.slice(0, 500).map(p => {
       const k = esc(p.username.toLowerCase());
       return `<tr><td><b>${esc(p.username)}</b><br><span class="small">${esc(p.email)}</span></td>
-<td class="small">joined ${esc(String(p.created).slice(0, 10))}<br>last seen ${esc(String(p.seen || '').slice(0, 10))}<br>terms ${esc(p.terms ? p.terms.version : 'not yet')}</td>
+<td class="small">joined ${esc(String(p.created).slice(0, 10))}<br>last seen ${esc(String(p.seen || '').slice(0, 10))}<br>terms ${esc(p.terms ? p.terms.version : 'not yet')}<br>${p.progress && p.progress.stamp ? `synced ${esc(ago(p.progress.at))}${p.progress.role ? ' &middot; ' + esc(p.progress.role) : ''}` : 'no saved game yet'}</td>
 <td><form method="post" action="/admin/players" onsubmit="return confirm('Give ${k} a new password? (Tell them by email.)')">${hidden}<input type="hidden" name="action" value="reset"><input type="hidden" name="who" value="${k}"><button type="submit">New password</button></form>
 <form method="post" action="/admin/players" onsubmit="return confirm('DELETE the account ${k}? This cannot be undone.')">${hidden}<input type="hidden" name="action" value="delete"><input type="hidden" name="who" value="${k}"><button type="submit" style="background:#ff8a80">Delete</button></form></td></tr>`;
     }).join('');
@@ -643,8 +738,8 @@ ${list.length > 500 ? `<p class="small">Showing the newest 500 of ${list.length}
 
     if (action === 'csv') {
       const q = (s) => '"' + String(s || '').replace(/"/g, '""') + '"';
-      const lines = ['username,email,created,last_seen,terms_version,terms_agreed'].concat(Object.values(state.players).map(p =>
-        [p.username, p.email, p.created, p.seen, p.terms && p.terms.version, p.terms && p.terms.at].map(q).join(',')));
+      const lines = ['username,email,created,last_seen,terms_version,terms_agreed,last_sync,role'].concat(Object.values(state.players).map(p =>
+        [p.username, p.email, p.created, p.seen, p.terms && p.terms.version, p.terms && p.terms.at, p.progress && p.progress.stamp ? p.progress.at : '', p.progress ? p.progress.role : ''].map(q).join(',')));
       res.writeHead(200, { 'content-type': 'text/csv; charset=utf-8', 'content-disposition': `attachment; filename="live-accounts-${stamp}.csv"`, 'cache-control': 'no-store' });
       res.end(lines.join('\n'));
       return;

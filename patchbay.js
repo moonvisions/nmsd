@@ -19,6 +19,14 @@
 // Older games ignore the line. A room's host can patch stages from inside the game too ({"patch":{...}}), except
 // stages you have patched here (yours win).
 //
+// Round 75: TWITCH. A DJ can paste their Twitch channel link (https://twitch.tv/name). The game can't play a Twitch page,
+// so when that DJ goes live the server asks Twitch for the channel's HLS playlist (the way streamlink does: a playback
+// token from gql.twitch.tv, then usher.ttvnw.net) and sends PLAYERS the playlist as kind "hls" (plus "via":"twitch").
+// The saved link stays the Twitch one; the token is renewed every 15 minutes while live (it expires) and the stage is
+// pushed again when the playlist address changes. Best effort: if Twitch changes its ways, the test says so in words.
+// Also: Opus (.opus) links are refused (the game can't play them), and the DJ page / admin page explain in plain words
+// how to get a link (Twitch, Icecast audio, or OBS -> a video service that gives an .m3u8).
+//
 // FILES: patchbay-data.json (kept out of GitHub by .gitignore - it holds the DJs' private links). It lives in
 // STORE_DATA_DIR (a persistent disk) when that is set, or PATCHBAY_DIR, else next to this file. A FREE Render
 // server forgets files when it restarts, so the page has "Download backup"; paste that backup into a Render
@@ -32,6 +40,7 @@ const net = require('net');
 const https = require('https');
 
 const pay = () => require('./payments');   // (lazy: payments.js requires this file too)
+const analytics = () => require('./analytics');   // Round 75: DJ go-live / stop are counted on the stats page (lazy: it loads payments)
 
 // ============================================================================ what there is
 const STAGES = [
@@ -42,8 +51,17 @@ const STAGES = [
   { id: 'venue', name: 'Artist Venue' }
 ];
 const STAGE_IDS = STAGES.map(s => s.id);
-const KINDS = ['hls', 'video', 'mp3', 'aac', 'ogg'];
-const KIND_NAMES = { hls: 'HLS video (.m3u8)', video: 'video (.mp4)', mp3: 'audio (MP3 / Icecast)', aac: 'audio (AAC)', ogg: 'audio (Ogg)' };
+const KINDS = ['hls', 'video', 'mp3', 'aac', 'ogg', 'twitch'];
+const KIND_NAMES = { hls: 'HLS video (.m3u8)', video: 'video (.mp4)', mp3: 'audio (MP3 / Icecast)', aac: 'audio (AAC)', ogg: 'audio (Ogg)', twitch: 'Twitch channel (players get its HLS stream)' };
+const OPUS_TEXT = 'Opus isn\'t supported in the game - use MP3 or AAC (Icecast) or HLS';
+
+// Round 75: Twitch
+const TWITCH_CLIENT_ID = 'kimne78kx3ncx6brgo4mv6wki5h1ko';   // Twitch's own web player id (what streamlink uses)
+const TWITCH_TOKEN_HASH = '0828119ded1c13477966434e15800ff57ddacf13ba1911c129dc2200705b0712';   // the PlaybackAccessToken query
+const TWITCH_TIMEOUT = 12000;
+const TWITCH_REFRESH = 15 * 60000;    // a playlist address is renewed this often while the DJ is live (tokens expire)
+const TWITCH_RETRY = 60000;           // after a failed look-up, try again this much later
+const TWITCH_OFFLINE = 'That Twitch channel isn\'t live right now (go live on Twitch first)';
 
 const MAX_URL = 500;             // characters in a stream link
 const MAX_DJS = 300;
@@ -168,6 +186,7 @@ function cleanStreamUrl(value) {
   let u;
   try { u = new URL(text); } catch { return ''; }
   if (u.protocol !== 'https:' || u.username || u.password) return '';
+  if (isOpus(text)) return '';   // Round 75: the game can't play Opus (streamProblem says so in words)
   // Round 60 review: a trailing dot ("localhost.", "nas.local.") names the same host - check it without the dot.
   const host = u.hostname.toLowerCase().replace(/^\[|\]$/g, '').replace(/\.+$/, '');
   if (!host) return '';
@@ -178,16 +197,41 @@ function cleanStreamUrl(value) {
   return text;
 }
 
-/** What a link looks like from its address: hls, video, mp3, aac, ogg - or '' (the test can tell). */
-function kindOf(url) {
+/** The address part of a link before any ?query or #hash, lower-case. */
+function pathOf(url) {
   const lower = String(url || '').toLowerCase();
   const cut = lower.search(/[?#]/);
-  const p = cut >= 0 ? lower.slice(0, cut) : lower;
+  return cut >= 0 ? lower.slice(0, cut) : lower;
+}
+
+/** Round 75: an Opus link (.opus) - Unity's players can't decode it, so it's refused everywhere with OPUS_TEXT. */
+function isOpus(url) {
+  return pathOf(url).endsWith('.opus');
+}
+
+/**
+ * Round 75: the channel name from a Twitch channel link (https://twitch.tv/name, www. or m. too, trailing slash fine),
+ * lower-case - or '' if it isn't one (a VOD, a clip, a category page, a non-Twitch link).
+ */
+function twitchChannel(url) {
+  const m = /^https:\/\/(?:www\.|m\.)?twitch\.tv\/([A-Za-z0-9_]{3,25})\/?(?:[?#]|$)/.exec(String(url || '').trim());
+  if (!m) return '';
+  const name = m[1].toLowerCase();
+  // These are Twitch pages, never channels.
+  if (['directory', 'videos', 'settings', 'downloads', 'jobs', 'p', 'search', 'login', 'signup', 'subscriptions', 'inventory', 'wallet', 'drops', 'turbo', 'store'].includes(name)) return '';
+  return name;
+}
+
+/** What a link looks like from its address: hls, video, mp3, aac, ogg, twitch - or '' (the test can tell). */
+function kindOf(url) {
+  const lower = String(url || '').toLowerCase();
+  const p = pathOf(url);
+  if (twitchChannel(url)) return 'twitch';   // Round 75
   if (p.endsWith('.m3u8')) return 'hls';
   if (/\.(mp4|m4v|mov|webm)$/.test(p)) return 'video';
   if (p.endsWith('.mp3')) return 'mp3';
   if (/\.(aac|aacp|m4a)$/.test(p)) return 'aac';
-  if (/\.(ogg|oga|opus)$/.test(p)) return 'ogg';
+  if (/\.(ogg|oga)$/.test(p)) return 'ogg';   // (.opus is refused by cleanStreamUrl - never labelled ogg)
   if (lower.includes('icecast') || lower.includes('shoutcast') || /:8000\//.test(lower) || /\/(stream|live|radio)(\.|$|\/)/.test(p)) return 'mp3';
   return '';
 }
@@ -212,9 +256,110 @@ function kindFromResponse(type, head, headers) {
   if (t.startsWith('video/')) return 'video';
   if (t.includes('audio/mpeg') || t.includes('audio/mp3')) return 'mp3';
   if (t.includes('aac') || t.includes('audio/mp4') || t.includes('audio/x-m4a')) return 'aac';
-  if (t.includes('ogg') || t.includes('opus')) return 'ogg';
+  if (t.includes('opus')) return 'opus';   // Round 75: told apart so the test can say the game can't play it
+  if (t.includes('ogg')) return 'ogg';
   if (headers && (headers['icy-name'] || headers['icy-br'] || headers['icy-metaint'])) return 'mp3';   // an Icecast/Shoutcast server
   return '';
+}
+
+// ---------------------------------------------------------------------------- Round 75: Twitch
+const TWITCH_UNREACHABLE = 'Couldn\'t reach Twitch - try again in a minute';
+
+/**
+ * Round 75: asks Twitch for a channel's HLS playlist address, the way streamlink and the web player do: a playback
+ * access token from gql.twitch.tv (with Twitch's own web player id), then the usher playlist link carrying that token.
+ * Resolves the playlist URL (a string); rejects with an Error whose message is plain words for the DJ / organiser.
+ * The token is good for roughly twenty minutes: whoever uses this must ask again (TWITCH_REFRESH). Both hosts are fixed
+ * Twitch addresses, so the private-address checks for DJ links don't apply here.
+ */
+function resolveTwitch(channel) {
+  channel = String(channel || '').toLowerCase();
+  if (!/^[a-z0-9_]{3,25}$/.test(channel)) return Promise.reject(new Error('That isn\'t a Twitch channel link (it should look like https://twitch.tv/yourname).'));
+  const body = JSON.stringify({
+    operationName: 'PlaybackAccessToken',
+    variables: { isLive: true, login: channel, isVod: false, vodID: '', playerType: 'embed' },
+    extensions: { persistedQuery: { version: 1, sha256Hash: TWITCH_TOKEN_HASH } }
+  });
+  return new Promise((resolve, reject) => {
+    let finished = false;
+    const fail = text => { if (finished) return; finished = true; reject(new Error(text)); };
+    const done = url => { if (finished) return; finished = true; resolve(url); };
+    let req;
+    try {
+      req = https.request('https://gql.twitch.tv/gql', {
+        method: 'POST', timeout: TWITCH_TIMEOUT,
+        headers: { 'Client-ID': TWITCH_CLIENT_ID, 'Content-Type': 'application/json', 'content-length': Buffer.byteLength(body), 'user-agent': 'NewMoonSameDark-PatchBay/1.0', accept: '*/*' }
+      }, res => {
+        let text = '';
+        res.setEncoding('utf8');
+        res.on('data', c => { if (text.length < 64 * 1024) text += c; });
+        res.on('error', () => fail(TWITCH_UNREACHABLE));
+        res.on('end', () => {
+          try {
+            if (res.statusCode !== 200) { fail(`Twitch answered ${res.statusCode} instead of a playback token - try again in a minute`); return; }
+            let data;
+            try { data = JSON.parse(text); } catch { fail('Twitch sent an answer this server couldn\'t read - try again in a minute'); return; }
+            const tok = data && data.data && data.data.streamPlaybackAccessToken;
+            if (!tok || typeof tok.value !== 'string' || typeof tok.signature !== 'string' || !tok.value || !tok.signature) { fail(TWITCH_OFFLINE); return; }
+            const p = 1 + crypto.randomInt(9999999);
+            done(`https://usher.ttvnw.net/api/channel/hls/${channel}.m3u8?token=${encodeURIComponent(tok.value)}&sig=${encodeURIComponent(tok.signature)}&allow_source=true&allow_audio_only=true&player=twitchweb&fast_bread=true&p=${p}`);
+          } catch (err) {
+            fail(TWITCH_UNREACHABLE + ' (' + clip(err && err.message, 80) + ')');
+          }
+        });
+      });
+    } catch (err) {
+      fail(TWITCH_UNREACHABLE + ' (' + clip(err && err.message, 80) + ')');
+      return;
+    }
+    req.on('timeout', () => req.destroy(new Error('timed out')));
+    req.on('error', err => {
+      const m = String(err && err.message || '');
+      fail(/timed out/.test(m) ? 'Twitch didn\'t answer in time - try again in a minute' : TWITCH_UNREACHABLE + (m ? ' (' + clip(m, 80) + ')' : ''));
+    });
+    try { req.end(body); } catch (err) { fail(TWITCH_UNREACHABLE); }
+  });
+}
+
+/**
+ * Round 75: fetches an HLS playlist address and checks it really is one (#EXTM3U). Resolves '' when it is, else the
+ * problem in words. Used for Twitch (usher answers 404 when the channel isn't streaming, even with a good token).
+ */
+function playlistProblem(url) {
+  return new Promise(resolve => {
+    let finished = false;
+    const done = text => { if (finished) return; finished = true; clearTimeout(overall); resolve(text); };
+    const overall = setTimeout(() => done('The playlist didn\'t answer in time - try again in a minute'), TWITCH_TIMEOUT);
+    let req;
+    try {
+      req = https.get(url, { timeout: TWITCH_TIMEOUT, headers: { 'user-agent': 'NewMoonSameDark-PatchBay/1.0', accept: '*/*' } }, res => {
+        let head = '';
+        res.setEncoding('utf8');
+        res.on('data', c => { if (head.length < 4096) head += c; });
+        res.on('error', () => done(TWITCH_UNREACHABLE));
+        res.on('end', () => {
+          const status = res.statusCode || 0;
+          if (status === 404) { done(TWITCH_OFFLINE); return; }
+          if (status === 403) { done('Twitch refused the playlist (403) - the channel may be subscriber-only, or Twitch has changed its ways'); return; }
+          if (status !== 200) { done(`Twitch answered ${status} instead of the playlist - try again in a minute`); return; }
+          done(head.replace(/^﻿/, '').trimStart().startsWith('#EXTM3U') ? '' : 'Twitch answered, but not with an HLS playlist - try again in a minute');
+        });
+      });
+    } catch (err) {
+      done(TWITCH_UNREACHABLE);
+      return;
+    }
+    req.on('timeout', () => req.destroy(new Error('timed out')));
+    req.on('error', err => done(/timed out/.test(String(err && err.message)) ? 'The playlist didn\'t answer in time - try again in a minute' : TWITCH_UNREACHABLE));
+  });
+}
+
+/** Round 75: a Twitch channel's working playlist address right now (resolved + checked), or an Error in words. */
+async function twitchPlaylist(channel) {
+  const url = await resolveTwitch(channel);
+  const problem = await playlistProblem(url);
+  if (problem) throw new Error(problem);
+  return url;
 }
 
 /**
@@ -225,9 +370,19 @@ let testsRunning = 0;
 const MAX_TESTS = 4;               // Round 60: stream tests running at once (each holds a connection for a few seconds)
 
 function testStream(value) {
+  if (isOpus(value)) return Promise.resolve({ ok: false, kind: '', text: OPUS_TEXT + '.' });   // Round 75 (before the link check: it says WHY)
   const url = cleanStreamUrl(value);
   if (!url) return Promise.resolve({ ok: false, kind: '', text: 'That link can\'t be used: it must start with https://, be under ' + MAX_URL + ' characters, and be a public web address (not a home or local one).' });
   if (testsRunning >= MAX_TESTS) return Promise.resolve({ ok: false, kind: '', text: 'Several tests are running already - try again in a few seconds.' });
+  const channel = twitchChannel(url);
+  if (channel) {
+    // Round 75: a Twitch channel - ask Twitch for its playlist and make sure the playlist is really there.
+    testsRunning++;
+    return twitchPlaylist(channel)
+      .then(() => ({ ok: true, kind: 'twitch', text: `Twitch is live - HLS playlist found for ${channel}. Players get the stream as HLS (some Windows PCs can't play it - add a backup link too).` }))
+      .catch(err => ({ ok: false, kind: 'twitch', text: clip(err && err.message, 200) || TWITCH_UNREACHABLE }))
+      .finally(() => { testsRunning--; });
+  }
   testsRunning++;
   return new Promise(resolve => {
     let finished = false;
@@ -272,6 +427,7 @@ function testStream(value) {
             const kind = kindFromResponse(type, head, res.headers);
             res.destroy();
             if (!kind) { done({ ok: false, kind: '', text: `It answered, but it doesn't look like a video or audio stream (it sent "${clip(type, 60) || 'no type'}"). Use the stream link itself, not a web page.` }); return; }
+            if (kind === 'opus') { done({ ok: false, kind: '', text: OPUS_TEXT + ' (this stream is Opus).' }); return; }   // Round 75
             if (kind === 'hls' && !head.startsWith('#EXTM3U')) { done({ ok: false, kind, text: 'It says it\'s an HLS playlist, but the playlist is empty or broken.' }); return; }
             if (kind !== 'hls' && bytes === 0) { done({ ok: false, kind, text: 'It answered but sent no sound or picture yet. Is the DJ streaming right now?' }); return; }
             done({ ok: true, kind, text: `Working: ${KIND_NAMES[kind]}${res.headers['icy-name'] ? ' - "' + clip(res.headers['icy-name'], 40) + '"' : ''}.` });
@@ -337,7 +493,25 @@ function cleanDj(d) {
   const photo = cleanStreamUrl(d.photo);
   const streams = (Array.isArray(d.streams) ? d.streams : []).map(cleanStream).filter(Boolean).slice(0, MAX_STREAMS);
   const test = d.test && typeof d.test === 'object' ? { ok: !!d.test.ok, text: clip(d.test.text, 300), at: Number(d.test.at) || 0, kind: KINDS.includes(d.test.kind) ? d.test.kind : '' } : null;
-  return { id, name, genre: clip(d.genre, 24), photo, contact: clip(d.contact, 80), streams, key, locked: !!d.locked, createdAt: Number(d.createdAt) || Date.now(), test };
+  const out = { id, name, genre: clip(d.genre, 24), photo, contact: clip(d.contact, 80), streams, key, locked: !!d.locked, createdAt: Number(d.createdAt) || Date.now(), test };
+  // Round 75: what an approved artist application said (extra fields - a DJ added by hand simply hasn't got them).
+  if (APP_KINDS[d.kind]) out.kind = d.kind;
+  if (d.about) out.about = clipLines(d.about, 600);
+  if (Array.isArray(d.links)) {
+    const links = d.links.map(l => cleanStreamUrl(l)).filter(Boolean).slice(0, 3);
+    if (links.length) out.links = links;
+  }
+  if (d.when) out.when = clip(d.when, 200);
+  if (d.timezone) out.timezone = clip(d.timezone, 40);
+  return out;
+}
+
+// Round 75: what an applicant said they do (applications.js has the same list).
+const APP_KINDS = { dj: 'DJ', vj: 'VJ (visuals)', live: 'Live act', other: 'Other' };
+
+/** Like clip, but keeps line breaks (an application's "about you"). */
+function clipLines(value, max) {
+  return String(value == null ? '' : value).replace(/\r\n?/g, '\n').replace(/[\u0000-\u0009\u000b-\u001f\u007f<>]/g, '').replace(/\n{3,}/g, '\n\n').trim().slice(0, max);
 }
 
 function cleanSlot(s) {
@@ -464,16 +638,100 @@ function liveSlot(target, stage) {
   return state.slots.find(s => s.target === target && s.stage === stage && s.state === 'live') || null;
 }
 
+// ---------------------------------------------------------------------------- Round 75: Twitch links on a live stage
+// The game can't play a Twitch page, so a Twitch link is turned into its HLS playlist address before it goes to players.
+// Asking Twitch takes a moment (and stageView must answer at once), so the answers live in this cache and stageView only
+// reads it: tendTwitch (called when a slot goes live and from every sweep) fills it, renews it every TWITCH_REFRESH while
+// the DJ is live (the token expires), tries again TWITCH_RETRY after a failure, and pushes the stage when the address changes.
+const twitchCache = new Map();   // target|stage|main or |backup -> { channel, url, at, failAt, error, pending }
+
+function twitchEntry(target, stage, which, channel) {
+  const key = target + '|' + stage + '|' + which;
+  let e = twitchCache.get(key);
+  if (!e || e.channel !== channel) { e = { channel, url: '', at: 0, failAt: 0, error: '', pending: false }; twitchCache.set(key, e); }
+  return e;
+}
+
+/** The playlist address players should get for this stage's Twitch stream right now ('' while it's being looked up or failed). */
+function twitchUrlFor(target, stage, which, channel) {
+  const e = twitchCache.get(target + '|' + stage + '|' + which);
+  return e && e.channel === channel ? e.url : '';
+}
+
+/** Looks up / renews the Twitch streams of one live stage (nothing to do if it has none). Safe to call often. */
+function tendTwitch(target, stage) {
+  const live = liveSlot(target, stage);
+  const now = Date.now();
+  const wanted = [];
+  if (live) {
+    const s = streamOf(live);
+    const b = backupOf(live, s.url);
+    if (s.kind === 'twitch') wanted.push(['main', twitchChannel(s.url)]);
+    if (b.kind === 'twitch') wanted.push(['backup', twitchChannel(b.url)]);
+  }
+  for (const which of ['main', 'backup']) {
+    const want = wanted.find(w => w[0] === which);
+    if (!want || !want[1]) { twitchCache.delete(target + '|' + stage + '|' + which); continue; }
+    const e = twitchEntry(target, stage, which, want[1]);
+    if (e.pending) continue;
+    const due = e.url ? now - e.at >= TWITCH_REFRESH : now - e.failAt >= TWITCH_RETRY;
+    if (!due) continue;
+    e.pending = true;
+    twitchPlaylist(e.channel).then(url => {
+      e.pending = false;
+      const changed = e.url !== url;
+      e.url = url; e.at = Date.now(); e.failAt = 0; e.error = '';
+      if (changed) pushStage(target, stage);
+    }).catch(err => {
+      e.pending = false;
+      const hadUrl = !!e.url;
+      e.url = ''; e.at = 0; e.failAt = Date.now(); e.error = clip(err && err.message, 200);
+      console.log(`patchbay: twitch ${e.channel} on ${target} ${stage}: ${e.error}`);
+      if (hadUrl) pushStage(target, stage);   // the players fall back to the backup link (or "connecting") until it's back
+    });
+  }
+}
+
+/** Every live stage's Twitch streams, tended (from sweep). Cache rows of stages that are no longer live go. */
+function tendAllTwitch() {
+  const seen = new Set();
+  for (const s of state.slots) {
+    if (s.state !== 'live') continue;
+    const key = s.target + '|' + s.stage;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    tendTwitch(s.target, s.stage);
+  }
+  for (const key of Array.from(twitchCache.keys())) {
+    if (!seen.has(key.slice(0, key.lastIndexOf('|')))) twitchCache.delete(key);
+  }
+}
+
 /** One stage as players see it. */
 function stageView(target, stage, now) {
   const live = liveSlot(target, stage);
   const next = runningOrder(target, stage)[0] || null;
-  const out = { relay: 'patch', stage, live: false, dj: '', genre: '', photo: '', url: '', kind: '', backup: '', backupKind: '', liveFor: 0, next: '', nextIn: -1, by: '' };
+  const out = { relay: 'patch', stage, live: false, dj: '', genre: '', photo: '', url: '', kind: '', via: '', backup: '', backupKind: '', backupVia: '', liveFor: 0, next: '', nextIn: -1, by: '' };
   if (live) {
     const who = djOf(live);
-    const s = streamOf(live);
-    const b = backupOf(live, s.url);
-    Object.assign(out, { live: true, dj: who.name, genre: who.genre || '', photo: who.photo || '', url: s.url, kind: s.kind, backup: b.url, backupKind: b.kind, liveFor: Math.max(0, Math.round((now - live.liveAt) / 1000)), by: live.by });
+    let s = streamOf(live);
+    let b = backupOf(live, s.url);
+    let via = '', backupVia = '';
+    // Round 75: a Twitch link goes out as the HLS playlist Twitch gave us (via:"twitch"); the saved link stays the Twitch one.
+    if (s.kind === 'twitch') {
+      via = 'twitch';
+      s = { url: twitchUrlFor(target, stage, 'main', twitchChannel(s.url)), kind: 'hls' };
+    }
+    if (b.kind === 'twitch') {
+      backupVia = 'twitch';
+      b = { url: twitchUrlFor(target, stage, 'backup', twitchChannel(b.url)), kind: 'hls' };
+    }
+    if (!s.url) {
+      // Twitch is still being looked up (or isn't answering): the backup plays meanwhile; with no backup the game shows "connecting".
+      if (b.url) { s = b; via = backupVia; b = { url: '', kind: '' }; backupVia = ''; } else s = { url: '', kind: '' };
+    }
+    if (!b.url) { b = { url: '', kind: '' }; backupVia = ''; }
+    Object.assign(out, { live: true, dj: who.name, genre: who.genre || '', photo: who.photo || '', url: s.url, kind: s.kind, via, backup: b.url, backupKind: b.kind, backupVia, liveFor: Math.max(0, Math.round((now - live.liveAt) / 1000)), by: live.by });
     if (live.minutes > 0) out.endsIn = Math.max(0, Math.round((live.liveAt + live.minutes * 60000 - now) / 1000));
   }
   if (next) {
@@ -483,7 +741,7 @@ function stageView(target, stage, now) {
   return out;
 }
 
-function signature(v) { return [v.live, v.dj, v.url, v.kind, v.backup, v.next, v.by, v.genre, v.photo, v.next ? Math.round(v.nextIn / 60) : 0].join('|'); }
+function signature(v) { return [v.live, v.dj, v.url, v.kind, v.via, v.backup, v.backupKind, v.next, v.by, v.genre, v.photo, v.next ? Math.round(v.nextIn / 60) : 0].join('|'); }
 
 /** Lines for everyone joining a room: one per stage that has something on it. */
 function linesFor(target) {
@@ -510,15 +768,24 @@ function pushStage(target, stage) {
 
 function pushAll(target) { for (const stage of STAGE_IDS) pushStage(target, stage); }
 
+/** Round 75: the stats page counts DJ sets starting and ending (analytics may not be loaded in tests - never let that matter). */
+function noteActivity(id) {
+  try { analytics().noteActivity(id); } catch { /* stats are a nicety */ }
+}
+
 function endSlot(slot, now) {
   slot.state = 'done';
   slot.endAt = now;
+  noteActivity('dj_stop');
 }
 
 function goLive(slot, now) {
   for (const s of state.slots) if (s !== slot && s.target === slot.target && s.stage === slot.stage && s.state === 'live') endSlot(s, now);
   slot.state = 'live';
   slot.liveAt = now;
+  noteActivity('dj_live');
+  // Round 75: a Twitch link is looked up now; the caller's pushStage sends the stage again when the answer arrives.
+  try { tendTwitch(slot.target, slot.stage); } catch (err) { console.error('patchbay twitch', err && err.message); }
 }
 
 function trimSlots(now) {
@@ -569,6 +836,7 @@ function sweep() {
     const cut = key.lastIndexOf('|');
     pushStage(key.slice(0, cut), key.slice(cut + 1));
   }
+  tendAllTwitch();   // Round 75: Twitch playlists renewed / retried while DJs are live
 }
 setInterval(() => { try { sweep(); } catch (err) { console.error('patchbay sweep', err && err.message); } }, 5000).unref();
 
@@ -629,7 +897,8 @@ function hostPatch(target, p) {
 /**
  * Round 66: a festival's DJ set times for the game's schedule board (GET /schedule): the sets live now and the ones with a
  * set time in the next <horizon> ms, earliest first - [{stage, dj, at, minutes, live}]. Queued sets with no time (the
- * organiser presses GO LIVE) aren't on it: they have no time to show.
+ * organiser presses GO LIVE) aren't on it: they have no time to show. A LIVE set is always on it, with live:true and
+ * at = when it actually went live (in the past - the horizon never drops it), so the board can say "on now".
  */
 function scheduleFor(target, now, horizon) {
   target = validTarget(target);
@@ -694,6 +963,25 @@ const TZ_SCRIPT = `<script>
 document.querySelectorAll('input.tz').forEach(e=>{e.value=new Date().getTimezoneOffset()});
 document.querySelectorAll('[data-ms]').forEach(e=>{const d=new Date(Number(e.dataset.ms));if(!isNaN(d))e.textContent=d.toLocaleString([], {weekday:'short',hour:'2-digit',minute:'2-digit'})+' ('+e.textContent+')'});
 </script>`;
+
+// Round 75: the same plain-words guide on the DJ's own page, the admin's DJ form and the quick test (see also README.txt).
+const HOW_TO_LINK = `<h3 style="margin-bottom:4px">How to get a stream link</h3><ol class="small" style="margin-top:4px;padding-left:20px">
+<li><b>Twitch (easiest):</b> paste your channel link, e.g. <span class="link" style="display:inline;padding:1px 4px">https://twitch.tv/yourname</span> - go live in OBS or your DJ software to Twitch as usual.
+Works best on phones and Macs; some Windows PCs can't play Twitch's HLS, so add a backup link too.</li>
+<li><b>Audio only, most reliable everywhere:</b> stream MP3 or AAC to an Icecast server with BUTT (free) or Mixxx - your host gives you a link like
+<span class="link" style="display:inline;padding:1px 4px">https://host:8000/live</span>. Paste that.</li>
+<li><b>Your own RTMP (OBS &rarr; a video service):</b> services like AWS IVS or Cloudflare Stream give you an RTMP address for OBS and a playback .m3u8 link - paste the .m3u8 link here.
+(Our game server can't take RTMP directly: Render only passes web traffic.)</li></ol>
+<p class="small muted">Not supported: Opus (.opus) links - the game can't play them - and web pages with a player on them (YouTube, SoundCloud, Mixcloud...).</p>`;
+
+/** Round 75: a live stage's Twitch look-up, in words, for the admin page. */
+function twitchNote(target, stage) {
+  const e = twitchCache.get(target + '|' + stage + '|main');
+  if (!e) return 'Twitch: looking up the playlist...';
+  if (e.url) return 'Twitch: playlist found' + (e.at ? ' (' + ago(e.at - Date.now()) + ')' : '');
+  if (e.pending && !e.failAt) return 'Twitch: looking up the playlist...';
+  return 'Twitch: ' + (e.error || 'not answering') + ' - trying again every minute';
+}
 
 function ago(ms) {
   const m = Math.round(Math.abs(ms) / 60000);
@@ -786,7 +1074,7 @@ function adminHtml(key, note) {
       const v = stageView(t, st.id, now);
       if (!v.live && !v.next) continue;
       rowsNow.push(`<tr><td><b>${h(st.name)}</b><br><span class="small">${h(targetTitle(t, rooms))}</span></td><td>${v.live
-        ? `<span class="live">LIVE</span> ${h(v.dj)} <span class="small">for ${h(ago(-v.liveFor * 1000).replace(' ago', ''))}${v.url ? '' : ' - NO STREAM LINK'}</span><br>${button(key, 'stage-stop', { target: t, stage: st.id }, 'STOP', 'stop')}`
+        ? `<span class="live">LIVE</span> ${h(v.dj)} <span class="small">for ${h(ago(-v.liveFor * 1000).replace(' ago', ''))}${v.url ? (v.via === 'twitch' ? ' - via Twitch' : '') : v.via === 'twitch' ? ' - ' + h(twitchNote(t, st.id)) : ' - NO STREAM LINK'}</span><br>${button(key, 'stage-stop', { target: t, stage: st.id }, 'STOP', 'stop')}`
         : '<span class="muted">own music</span>'}${v.next ? `<br><span class="next">Next: ${h(v.next)}</span> <span class="small">${v.nextIn >= 0 ? h(ago(v.nextIn * 1000)) : 'queued'}</span> ${button(key, 'stage-golive', { target: t, stage: st.id }, 'GO LIVE', 'go')}` : ''}</td></tr>`);
     }
   }
@@ -804,7 +1092,7 @@ function adminHtml(key, note) {
       const summary = v.live ? `<span class="live">LIVE</span> ${h(v.dj)}` : order.length ? `<span class="next">next: ${h(v.next)}</span>` : '<span class="muted">own music</span>';
       const lines = [];
       if (live) {
-        lines.push(`<div class="row"><span class="grow"><span class="live">LIVE</span> ${h(djOf(live).name)} <span class="small">${h(streamOf(live).url || 'no stream link')}${live.minutes ? ' &middot; ends ' + h(ago(live.liveAt + live.minutes * 60000 - now)) : ''}${live.by === 'host' ? ' &middot; patched from the game' : ''}</span></span>${button(key, 'stage-stop', { target: t, stage: st.id }, 'STOP', 'stop')}</div>`);
+        lines.push(`<div class="row"><span class="grow"><span class="live">LIVE</span> ${h(djOf(live).name)} <span class="small">${h(streamOf(live).url || 'no stream link')}${streamOf(live).kind === 'twitch' ? ' &middot; ' + h(twitchNote(t, st.id)) : ''}${live.minutes ? ' &middot; ends ' + h(ago(live.liveAt + live.minutes * 60000 - now)) : ''}${live.by === 'host' ? ' &middot; patched from the game' : ''}</span></span>${button(key, 'stage-stop', { target: t, stage: st.id }, 'STOP', 'stop')}</div>`);
       }
       order.forEach((s, i) => {
         lines.push(`<div class="row"><span class="grow">${i + 1}. <b>${h(djOf(s).name)}</b> <span class="small">${when(s.at, now)}${s.minutes ? ', ' + s.minutes + ' min' : ''} &middot; ${h(streamOf(s).url || 'no stream link')}</span></span>
@@ -836,7 +1124,8 @@ ${button(key, 'slot-live', { slot: s.id }, 'GO LIVE now', 'go')}${s.at ? '' : bu
   for (const d of djs) {
     const link = (pay().baseUrl() || 'https://YOUR-SERVER.onrender.com') + '/dj?key=' + d.key;
     const sets = state.slots.filter(s => s.djId === d.id && s.state !== 'done').length;
-    parts.push(`<div class="card">${d.photo ? `<img class="dj" src="${h(d.photo)}" alt="" referrerpolicy="no-referrer">` : ''}<b>${h(d.name)}</b> <span class="small">${h(d.genre || '')}${d.contact ? ' &middot; ' + h(d.contact) : ''} &middot; ${sets} set${sets === 1 ? '' : 's'} coming up${d.locked ? ' &middot; LOCKED' : ''}</span>
+    parts.push(`<div class="card">${d.photo ? `<img class="dj" src="${h(d.photo)}" alt="" referrerpolicy="no-referrer">` : ''}<b>${h(d.name)}</b> <span class="small">${d.kind ? h(APP_KINDS[d.kind]) + ' &middot; ' : ''}${h(d.genre || '')}${d.contact ? ' &middot; ' + h(d.contact) : ''} &middot; ${sets} set${sets === 1 ? '' : 's'} coming up${d.locked ? ' &middot; LOCKED' : ''}</span>
+${d.about ? `<p class="small" style="white-space:pre-wrap">${h(d.about)}</p>` : ''}${d.when || d.timezone ? `<p class="small muted">Can play: ${h(d.when || '-')}${d.timezone ? ' (' + h(d.timezone) + ')' : ''}</p>` : ''}${d.links && d.links.length ? `<p class="small muted">Links: ${d.links.map(l => `<a href="${h(l)}" rel="noopener noreferrer nofollow" target="_blank">${h(l)}</a>`).join(' &middot; ')}</p>` : ''}
 ${d.streams.map((s, i) => `<div class="row"><span class="grow small">${i === 0 ? 'Main' : 'Backup'}: ${h(s.url)} <span class="muted">(${h(KIND_NAMES[s.kind] || 'type found by the test')})</span></span>${button(key, 'dj-test', { dj: d.id, i }, 'Test stream', 'ghost')}</div>`).join('') || '<p class="small bad">No stream link yet - add one (Edit), or send the DJ their link so they can.</p>'}
 ${d.test ? `<p class="small ${d.test.ok ? 'ok' : 'bad'}">Last test (${h(ago(d.test.at - now))}): ${h(d.test.text)}</p>` : ''}
 <p class="small">Their private DJ link (send it only to them):</p><div class="link">${h(link)}</div>
@@ -847,7 +1136,7 @@ ${d.test ? `<p class="small ${d.test.ok ? 'ok' : 'bad'}">Last test (${h(ago(d.te
 
   // ---- a quick stream test
   parts.push(`<h2>Test any stream link</h2><form method="post" action="/admin/patch" class="row">${hidden(key)}<input type="hidden" name="action" value="test">
-<input name="url" placeholder="https://..." class="grow"><button type="submit">Test stream</button></form>`);
+<input name="url" placeholder="https://..." class="grow"><button type="submit">Test stream</button></form>${HOW_TO_LINK}`);
 
   // ---- live events made here
   const vendorOn = !!(pay().vendorFeatures().liveEvents);
@@ -881,8 +1170,9 @@ function djForm(key, action, d) {
   return `<form method="post" action="/admin/patch">${hidden(key)}<input type="hidden" name="action" value="${action}">${d ? `<input type="hidden" name="dj" value="${h(d.id)}">` : ''}
 <label>DJ name</label><input name="name" maxlength="40" value="${h(d ? d.name : '')}" style="width:100%">
 <label>Genre</label><input name="genre" maxlength="24" value="${h(d ? d.genre : '')}" placeholder="house, techno, drum &amp; bass...">
-<label>Main stream link (https:// - an HLS .m3u8 or .mp4 video, or an Icecast .mp3/.aac/.ogg audio link)</label><input name="stream0" value="${h(s0)}" style="width:100%" placeholder="https://...">
-<label>Backup stream link (optional)</label><input name="stream1" value="${h(s1)}" style="width:100%" placeholder="https://...">
+<label>Main stream link (https:// - a Twitch channel link, an HLS .m3u8 or .mp4 video link, or an Icecast .mp3/.aac/.ogg audio link - not .opus)</label><input name="stream0" value="${h(s0)}" style="width:100%" placeholder="https://twitch.tv/theirname or https://...">
+<label>Backup stream link (optional - for Twitch DJs, an audio link here means Windows players hear them too)</label><input name="stream1" value="${h(s1)}" style="width:100%" placeholder="https://...">
+<details><summary>How to get a stream link</summary>${HOW_TO_LINK}</details>
 <label>Photo link (optional, https://)</label><input name="photo" value="${h(d ? d.photo : '')}" style="width:100%">
 <label>Contact (optional - email or phone, only you see it)</label><input name="contact" maxlength="80" value="${h(d ? d.contact : '')}" style="width:100%">
 <div><button type="submit">${d ? 'Save' : 'Add DJ'}</button></div></form>`;
@@ -1199,14 +1489,13 @@ function djHtml(d, note) {
     parts.push(`<div class="card">${head}${act}</div>`);
   }
   parts.push(`<h2>Your stream link</h2><form method="post" action="/dj">${k}<input type="hidden" name="action" value="streams">
-<label>Main link (https:// - an HLS .m3u8 or .mp4 video link, or an Icecast .mp3 / .aac / .ogg audio link)</label><input name="stream0" value="${h(d.streams[0] ? d.streams[0].url : '')}" style="width:100%">
-<label>Backup link (optional)</label><input name="stream1" value="${h(d.streams[1] ? d.streams[1].url : '')}" style="width:100%">
+<label>Main link (https:// - your Twitch channel link, an HLS .m3u8 or .mp4 video link, or an Icecast .mp3 / .aac / .ogg audio link - not .opus)</label><input name="stream0" value="${h(d.streams[0] ? d.streams[0].url : '')}" style="width:100%">
+<label>Backup link (optional - if your main link is Twitch, an audio link here means Windows players hear you too)</label><input name="stream1" value="${h(d.streams[1] ? d.streams[1].url : '')}" style="width:100%">
 <div class="row" style="margin-top:8px"><button type="submit">Save my links</button></div></form>
 <form method="post" action="/dj">${k}<input type="hidden" name="action" value="test"><button type="submit" class="ghost">Test my main link</button></form>
 ${d.test ? `<p class="small ${d.test.ok ? 'ok' : 'bad'}">Last test (${h(ago(d.test.at - now))}): ${h(d.test.text)}</p>` : ''}
-<h2>How to stream</h2><p class="small">Stream from OBS (video) or your DJ software (audio) to a streaming service that gives you a public https:// link:
-a video service that gives an HLS link ending in .m3u8, or an internet-radio (Icecast) host that gives an .mp3/.aac link. Paste that link above,
-press "Test my main link" once you're streaming, then press "I'm live" when your set starts. Players hear you on your stage a few seconds later.</p>`);
+${HOW_TO_LINK}
+<p class="small">Paste your link above, press "Test my main link" once you're streaming, then press "I'm live" when your set starts. Players hear you on your stage a few seconds later.</p>`);
   parts.push(TZ_SCRIPT);
   return parts.join('\n');
 }
@@ -1284,7 +1573,11 @@ function addDjFromApplication(app) {
   const r = djFields(form);
   if (!r.ok) return { ok: false, text: r.text };
   const id = newDjId(r.fields.name);
-  state.djs[id] = Object.assign({ id, key: newKey(), locked: false, createdAt: Date.now(), test: null }, r.fields);
+  // Round 75: what they told us in the application rides along (cleanDj keeps only what's sensible), shown on their card.
+  const extra = cleanDj(Object.assign({ id, name: r.fields.name, key: 'x'.repeat(16), kind: app.kind, about: app.about, links: app.links, when: app.when, timezone: app.timezone }));
+  const kept = {};
+  for (const k of ['kind', 'about', 'links', 'when', 'timezone']) if (extra && extra[k] != null) kept[k] = extra[k];
+  state.djs[id] = Object.assign({ id, key: newKey(), locked: false, createdAt: Date.now(), test: null }, r.fields, kept);
   save();
   return { ok: true, text: `${r.fields.name} is on the DJ roster.`, id, link: djLinkFor(id) };
 }
@@ -1366,6 +1659,7 @@ module.exports = {
   scheduleFor,   // Round 66: the public festival's schedule board
   addDjFromApplication, djLinkFor,   // Round 67: approved artist applications join the roster (applications.js)
   mergeIntoFeed, adminSection, flush, cleanStreamUrl, kindOf, testStream,
+  isOpus, twitchChannel, resolveTwitch,   // Round 75
   shownRooms,
-  _test: { isPrivateIp, sweep, state: () => state, setAllowLocal: v => { allowLocalForTests = !!v; }, parseLocalTime, stageView, adminAction, djAction, findDjByKey, reset: () => { state = blank(); lastSent.clear(); roomGoneAt.clear(); } }
+  _test: { isPrivateIp, sweep, tendTwitch, twitchCache, playlistProblem, state: () => state, setAllowLocal: v => { allowLocalForTests = !!v; }, parseLocalTime, stageView, adminAction, djAction, findDjByKey, reset: () => { state = blank(); lastSent.clear(); roomGoneAt.clear(); } }
 };

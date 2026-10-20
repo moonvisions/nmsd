@@ -395,6 +395,7 @@ ${note ? `<div class="code" style="font-size:15px;letter-spacing:0;text-align:le
 </table>
 ${patchbay.adminSection(hidden)}
 ${applications.adminSection(hidden)}
+${require('./sellers').adminSection(hidden)}
 ${analytics().adminSection(hidden)}
 ${require('./players').adminSection(hidden)}
 <h2>Live events</h2>

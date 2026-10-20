@@ -456,7 +456,8 @@ function adminAction(action, form) {
     case 'approve': {
       let onRoster = app.djId && patchbay().djLinkFor(app.djId);
       if (!onRoster) {
-        const r = patchbay().addDjFromApplication({ name: app.name, genre: app.genre, contact: app.contact, stream: app.stream });
+        const r = patchbay().addDjFromApplication({ name: app.name, genre: app.genre, contact: app.contact, stream: app.stream,
+          kind: app.kind, about: app.about, links: app.links, when: app.when, timezone: app.timezone });   // Round 75: shown on their DJ card
         if (!r.ok) return r.text;
         app.djId = r.id;
       }
