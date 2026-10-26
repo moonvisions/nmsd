@@ -1031,7 +1031,7 @@ function appsButton(key) {
   return `<form class="inline" method="post" action="/admin/applications">${hidden(key)}<button type="submit"${waiting ? '' : ' class="ghost"'}>Artist applications${waiting ? ` (${waiting} waiting)` : ''}</button></form>`;
 }
 
-function hidden(key) { return `<input type="hidden" name="key" value="${h(key)}">`; }
+function hidden(key) { return require('./adminauth').hidden(key); }   // Round 110: the session's CSRF token (key = that token now)
 
 function button(key, action, fields, text, cls, confirmText) {
   const inputs = Object.entries(fields || {}).map(([k, v]) => `<input type="hidden" name="${h(k)}" value="${h(v)}">`).join('');
@@ -1593,19 +1593,10 @@ function handle(req, res) {
   const P = pay();
 
   if (route === '/admin/patch') {
-    if (req.method !== 'POST') {
-      P.page(res, 200, 'DJ Patch Bay', `<h1>DJ Patch Bay</h1><form method="post" action="/admin/patch"><p>Admin password:</p>
-<input type="password" name="key" autocomplete="current-password"> <button type="submit">Open</button></form>`);
-      return true;
-    }
-    if (fails('adminkey|' + ip, 600000) >= 10) { P.page(res, 429, 'Wait', '<h1>Too many wrong passwords</h1><p>Wait ten minutes and try again.</p>'); return true; }
-    P.readForm(req, 600 * 1024).then(async form => {
-      const key = form.get('key');
-      if (!P.adminOk(key)) {
-        addFail('adminkey|' + ip);
-        P.page(res, 403, 'DJ Patch Bay', '<h1>DJ Patch Bay</h1><p>Wrong password (or ADMIN_KEY isn\'t set on the server).</p><a class="btn" href="/admin/patch">Try again</a>');
-        return;
-      }
+    // Round 110: the admin session (adminauth.js) - sign-in, wrong-key limits, CSRF and the old key form all live there.
+    require('./adminauth').guard(req, res, { path: '/admin/patch', limit: 600 * 1024 }).then(async g => {
+      if (!g) return;
+      const form = g.form, key = g.token;
       if (!limited('admin|' + ip, 120, 60000)) { P.page(res, 429, 'Wait', '<h1>Slow down</h1><p>Too many clicks - wait a moment.</p>'); return; }
       let note;
       try { note = await adminAction(form.get('action'), form); } catch (err) { console.error('patchbay admin', err && err.message); note = 'Something went wrong - try again.'; }

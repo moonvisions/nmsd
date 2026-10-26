@@ -16,6 +16,7 @@ STEP 1 - PUT THESE FILES ON GITHUB
  6. Drag in these files from this folder:  package.json  relay.js  payments.js  community.js
     leaderboards.js  store.js  storeverify.js  reports.js  patchbay.js  worlds.js  applications.js
     analytics.js  players.js  sellers.js  privacy.html  and vendors.json
+    (Round 110: + adminauth.js  adminhub.js  adminui.js  statsdash.js  secrets.js - the admin sign-in, home, dashboard and server keys)
     (Round 85: relay.js needs players.js and sellers.js at start - without them the server won't start)   (Round 69: storeverify.js checks Steam / Google Play / App Store purchases -
     see STORE_PURCHASES_SETUP.txt)
     (NOT the node_modules folder, and NEVER tickets.json - codes are secret)
@@ -762,7 +763,97 @@ up (upload, keeping it awake for free or for about $7 a month, DJ set times): se
 
 
 
+==========================================================================================================
+YOUR ADMIN PAGES (Round 110) - one sign-in, one home page, works on your phone
+==========================================================================================================
+THE ADDRESS
+    https://nmsd.onrender.com/admin
+Bookmark it on your computer and on your phone (Chrome: the three dots > the star; or "Add to Home screen").
+
+HOW TO SIGN IN
+ 1. Open the address above. You see "New Moon admin" with one box.
+ 2. Type your admin password - it's the ADMIN_KEY you set on Render (Render > nmsd > Environment > ADMIN_KEY).
+ 3. Tap "Sign in". That's it: you stay signed in on that phone or computer for 12 hours.
+ - "Sign out" (top right of every page) signs that device out. "Sign out everywhere" (bottom of the home page)
+   signs out every phone and computer - use it if you lose your phone or used someone else's computer.
+ - After an update of the server (or if Render restarts it) you're asked to sign in again. That's normal.
+ - If you tap a link to your admin page from another app (email, Messages), it may ask you to sign in again -
+   that's a safety feature (the sign-in only works from your own admin pages).
+ - 5 wrong passwords in 15 minutes lock that internet connection out for 15 minutes. If someone keeps guessing
+   from many places, signing in pauses for everyone for a short while (you stay signed in where you already are, and a
+   phone or computer you've signed in on before can still sign in - see "MAKE YOUR ADMIN SAFER" below).
+ - Your password is never shown in a page or an address, and the pages can't be changed from another website.
+
+MAKE YOUR ADMIN SAFER - DO THIS ONCE (about 5 minutes; the home page shows a red box until it's done)
+Why: a player's game receives small signed "tickets". Until now, if BOARD_SECRET wasn't set, those were signed with a key
+made from your ADMIN_KEY - so someone could try password guesses against a ticket on their own computer, very fast.
+That's fixed in this update (tickets no longer use ADMIN_KEY at all), but do these steps anyway, in this order:
+ A. Set BOARD_SECRET (a long random value):
+    1. Go to render.com and sign in. Click your service "nmsd". Click "Environment" on the left.
+    2. If BOARD_SECRET is already in the list, skip to B. Otherwise click "Add Environment Variable".
+    3. Key: BOARD_SECRET    Value: a long random text, 32+ characters. Easiest: the red box on your admin home page
+       shows one made just for you - copy it from there. (Or use your password manager's "generate password".)
+    4. Click "Save Changes". Render restarts the server (about 2 minutes).
+    5. If you use the GitHub backup for accounts: open your admin "Players" page and wait until it says
+       "GitHub backup: ON - last saved <time>" with a time AFTER the restart. (The backup is now locked with BOARD_SECRET,
+       so the next step can't make it unreadable.) Don't skip this one.
+ B. Change ADMIN_KEY to 24+ random characters:
+    1. Make a new password: 24 or more random letters and numbers (the red box shows one, or use a password manager).
+       SAVE IT FIRST in your password manager or write it down somewhere safe.
+    2. Render > nmsd > Environment > ADMIN_KEY > Edit > paste the new password > "Save Changes".
+    3. Wait for the restart, then sign in at /admin with the new password. The red box is gone.
+ - Never put any of these values in a file on GitHub (your repository is public).
+ - Optional extras (most people never need them): TICKET_HMAC_SECRET (signs connection tickets; else BOARD_SECRET is used),
+   ADMIN_DEVICE_SECRET (signs the "known device" cookie), BACKUP_KEY (locks the accounts backup; else BOARD_SECRET).
+   Without any of them the server makes its own random keys and keeps them in server-secrets.json on the disk.
+ - Your own browser is remembered as a "known device" for 180 days after you sign in. Even if a stranger keeps guessing
+   passwords and the server pauses sign-in for everyone else, your known phone / computer can still sign in.
+ - TRUST_PROXY_HOPS (advanced): how many proxies stand in front of the server and add the caller's address to
+   X-Forwarded-For. On Render it's 1 by itself - leave it unset. Off Render it's 0 (the connection's own address). Only
+   change it if a host's help page tells you there are more proxies in front.
+
+THE HOME PAGE (/admin)
+Six big tiles - tap one to open it. Each shows its most important number:
+ - Play stats ........... players playing right now (and today / new today / ever)
+ - Players .............. live accounts (look one player up, reset a password, delete an account)
+ - Store & payments ..... sales in the last 30 days (the old /admin page - now /admin/store)
+ - Applications ......... artists waiting for you to approve or decline
+ - Sellers .............. shops waiting for your review
+ - Patch bay ............ DJs on the roster and sets scheduled
+"Needs you" at the top lists anything waiting for you (applications, shops, errors, the old-build grace period).
+
+THE PLAY STATS PAGE (/admin/stats) - what each part means
+Pick "30 days" or "90 days" at the top. Every part has CSV (opens in Excel / Google Sheets) and JSON downloads.
+Hover over (or tap) a chart to see the exact numbers for a day.
+ - Right now ........ games open at this moment, by Windows / Mac / Android / Web; Open Festival attendance;
+                      live rooms (friends' festivals) and how many players are in them.
+ - Growth ........... DAU / WAU / MAU = players who played today / in the last 7 days / in the last 30 days.
+                      New players per day, and new installs compared with new accounts.
+                      (A "player" is one copy of the game on one device.)
+ - Retention ........ of the players who first played on a day, how many came back 1, 7 and 30 days later.
+                      Brighter gold = better. Games usually aim for about 40% / 15% / 5%.
+ - Engagement ....... average session length, sessions per player, hours played, building on the map vs walking
+                      on foot, and how far players get (demo > own festival > finished > ...).
+ - Platforms & versions .. the big number is "% of active players on build 109 or newer". Below it, a green /
+                      yellow / red box says whether it's safe to end the old-build grace period. YOU DON'T HAVE TO
+                      DO ANYTHING: the grace period ends by itself on LIVE_ACCOUNT_GRACE_UNTIL (2026-11-09). It's safe
+                      once "online-room play on old builds" stays under 2% for a week. If it's still high a few
+                      days before, move the date later in Render > nmsd > Environment > LIVE_ACCOUNT_GRACE_UNTIL.
+                      (Builds before 110 don't send their build number, so the page counts them as old to be safe.)
+ - Accounts ......... sign-ups per day, how many players are signed in vs anonymous.
+ - Features ......... the career (Local ... Legend, % who finished it), land plots, stage upgrades and modules,
+                      green rating, MX races (live vs solo), pyro shows, emotes, swag by rarity, the Speedway
+                      (earned in the career vs bought). These come from build 110 and newer.
+ - Money ............ real-money sales by platform (Stripe / Google Play / Steam), top products, items bought with
+                      Moon Shards, refunds. Read only - change things on "Store & payments". Test purchases left out.
+ - Health ........... crash-free players, errors per day / by version / by platform, the top errors, failed
+                      sign-ins, requests slowed down (rate limit), automatic-update failures, wrong admin passwords.
+PRIVACY: the stats page only shows counts - no names, no emails. To look up one player, use "Players".
+The stats aren't in the GitHub backup (they're big and only counts); download the CSVs now and then if you
+want a copy. They're kept on the permanent disk (STORE_DATA_DIR) like everything else.
+
 PLAY STATS - YOUR PRIVATE DASHBOARD (Round 71)
+(Round 110: this page was redesigned - see "YOUR ADMIN PAGES" just above. The list below is the old one.)
 Who plays, for how long, what they do, and money - on one password-protected page:
     https://nmsd.onrender.com/admin/stats
 It's also on your /admin page ("Play stats" > Open play stats).
@@ -791,7 +882,7 @@ GOOD TO KNOW
  - Players can switch it off: Settings > Game > Share play stats. Those players aren't counted.
  - Playing in the Unity editor is never counted (so your own testing doesn't show up).
  - Days are counted in UTC (a new day starts at 8 pm US Eastern in summer, 7 pm in winter).
- - 10 wrong passwords from one address lock that address out for 10 minutes.
+ - Round 110: wrong passwords - see "YOUR ADMIN PAGES" (5 in 15 minutes locks that address out for 15 minutes).
  - Files on the disk: analytics.json (everything) and analytics.json.bak (the version before).
 
 
@@ -883,6 +974,18 @@ ROUND 109 - DO THESE IN THIS ORDER (or older copies of the game can't host or jo
  After it, they're told to update. https://nmsd.onrender.com/players/status shows "grace":true while it's on.
  (The Open Festival needed an account already - the grace switch doesn't change it.) Delete the setting when the
  date has passed.
+
+ROUND 110 - THIS TIME THE SERVER GOES FIRST (sec110: no sign-in keys or passwords in web addresses)
+ 1. Upload the new server files to GitHub first (relay.js and analytics.js among them). They still take every older game.
+ 2. Then publish game build 110. (Build 110 sends a live event's password and a saved world's key as its first message
+    instead of in the address, and joins the Open Festival with a one-time ticket only - an older server can't read that.)
+ What changes for players:
+ - The Open Festival: older games (before 110) that join with their long-lived sign-in key are still let in, but ONLY
+   while LIVE_ACCOUNT_GRACE_UNTIL is in the future; after that date they're told "Update New Moon to play online".
+   Build 110 is never let in with the long-lived key there (it always uses a ticket, so nothing to do).
+ - Play stats (/admin/stats) no longer receive or keep player names or account ids - only "signed in: yes/no". Names
+   and ids already in analytics.json (and its .bak) are removed the first time the new server starts. Crash reports
+   have emails, sign-in keys / tickets, passwords and computer user names taken out before they're kept.
 
 EVERY ONLINE THING NEEDS THE ACCOUNT NOW (Round 109)
  - Before: only the Open Festival asked for a live account. Now EVERYTHING online does: the Open Festival,

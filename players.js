@@ -190,10 +190,30 @@ const VAULT_TOKEN = (process.env.BACKUP_GITHUB_TOKEN || '').trim();
 const VAULT_PATH = 'players.backup.json';
 const vault = { on: !!(VAULT_REPO && VAULT_TOKEN && /^[\w.-]+\/[\w.-]+$/.test(VAULT_REPO)), sha: null, pushedAt: '', error: '', loaded: false, timer: null, busy: false };
 
-function vaultKey() {
-  const secret = process.env.BACKUP_KEY || process.env.ADMIN_KEY || '';
-  return secret.length >= 8 ? crypto.scryptSync(secret, 'nmsd-live-accounts-backup', 32) : null;
-}
+// Round 110 (sec110 H1): the backup's key no longer comes from ADMIN_KEY when anything better is set. Sealing uses the
+// first of: BACKUP_KEY, BOARD_SECRET (16+ characters, mixed with its own label), and ONLY when neither is set the old
+// ADMIN_KEY way (the admin home page shows a red warning then - a random key on this server's disk would be lost with
+// the disk, and this backup exists for exactly that day). Opening a backup tries each of them, so a backup made the old
+// way still opens after BOARD_SECRET / BACKUP_KEY are set (the next save re-seals it with the new key).
+const vaultKeys = (() => {
+  const cache = new Map();
+  const derive = (label, secret, salt) => {
+    const k = label + '|' + secret;
+    if (!cache.has(k)) cache.set(k, crypto.scryptSync(secret, salt, 32));
+    return cache.get(k);
+  };
+  return () => {
+    const out = [];
+    if ((process.env.BACKUP_KEY || '').length >= 8) out.push(derive('backup', process.env.BACKUP_KEY, 'nmsd-live-accounts-backup'));
+    if ((process.env.BOARD_SECRET || '').length >= 16) out.push(derive('board', process.env.BOARD_SECRET, 'nmsd-live-accounts-backup|board'));
+    if ((process.env.ADMIN_KEY || '').length >= 8) out.push(derive('legacy', process.env.ADMIN_KEY, 'nmsd-live-accounts-backup'));   // (old backups; and the last resort - warned)
+    return out;
+  };
+})();
+function vaultKey() { return vaultKeys()[0] || null; }
+let resealNeeded = false;
+/** Round 110: is the backup sealed with a key that isn't worked out from ADMIN_KEY? (the admin home's warning) */
+function vaultKeyOk() { return (process.env.BACKUP_KEY || '').length >= 8 || (process.env.BOARD_SECRET || '').length >= 16; }
 
 function seal(obj) {
   const key = vaultKey();
@@ -206,12 +226,19 @@ function seal(obj) {
 
 function unseal(text) {
   const box = JSON.parse(text);
-  const key = vaultKey();
-  if (!key) throw new Error('BACKUP_KEY / ADMIN_KEY not set');
-  const d = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(box.iv, 'base64'));
-  d.setAuthTag(Buffer.from(box.tag, 'base64'));
-  const json = Buffer.concat([d.update(Buffer.from(box.data, 'base64')), d.final()]).toString('utf8');
-  return JSON.parse(json);
+  const keys = vaultKeys();
+  if (!keys.length) throw new Error('BACKUP_KEY / ADMIN_KEY not set');
+  let last = null;
+  for (const [i, key] of keys.entries()) {   // Round 110: the current key first, then the older ways (a backup made before BOARD_SECRET was set)
+    try {
+      resealNeeded = i > 0;   // (opened with an older key: saved again with the current one straight after start-up)
+      const d = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(box.iv, 'base64'));
+      d.setAuthTag(Buffer.from(box.tag, 'base64'));
+      const json = Buffer.concat([d.update(Buffer.from(box.data, 'base64')), d.final()]).toString('utf8');
+      return JSON.parse(json);
+    } catch (err) { last = err; }
+  }
+  throw last || new Error('could not open the backup');
 }
 
 async function github(method, body, raw) {
@@ -286,7 +313,7 @@ async function load() {
   index();
   ready = true;
   console.log(`players: ${count(state)} live accounts loaded${persistent() ? ' (disk)' : ''}${vault.on ? (vault.loaded ? ' (GitHub backup on)' : ' (GitHub backup NOT reachable)') : ''}`);
-  if (vault.on && vault.loaded && !remoteNewer && count(state) > 0) vaultSoon(3000);   // (the disk had something newer)
+  if (vault.on && vault.loaded && (!remoteNewer || resealNeeded) && count(state) > 0) vaultSoon(3000);   // (the disk had something newer; Round 110: or re-seal with the new key)
   if (vault.on && !vault.loaded) setTimeout(retryVault, 120000).unref();
 }
 
@@ -870,18 +897,16 @@ function storeLink(req, res, body, ip) {
 //
 // The game used to put its long-lived sign-in key in the WebSocket address (?pt=), where proxies and logs can see it. Now it
 // asks for a TICKET first: good for 60 seconds (LIVE_TICKET_SECONDS), for this account only, used once. A ticket is SIGNED
-// (HMAC, with a key worked out from BOARD_SECRET, else ADMIN_KEY - both already set on Render; else a random one for this
-// run), so any copy of this server accepts it - e.g. the new one during a redeploy overlap. Each copy remembers the tickets
+// (HMAC). Round 110 (sec110 H1): its key is NEVER worked out from ADMIN_KEY (a player could test ADMIN_KEY guesses offline
+// against their own ticket) - it's TICKET_HMAC_SECRET, else BOARD_SECRET, else a random key kept in server-secrets.json on the
+// disk (secrets.js), so any copy of this server with the same setting accepts it - e.g. the new one during a redeploy overlap. Each copy remembers the tickets
 // it has seen used. A ticket that's unknown, used or out of date is refused as "ticket: ..." (the game fetches a new one
 // and tries again - it never signs anyone out over it).
 const TICKET_MS = Math.max(1000, Math.min(600000, (Number(process.env.LIVE_TICKET_SECONDS) || 60) * 1000));
 const TICKET_RE = /^tk1-(u[0-9a-f]{24})-([0-9a-z]{1,12})-([0-9a-f]{16})-([0-9a-f]{32})$/;
 const usedTickets = new Map();   // nonce -> expiry (used here)
 const MAX_USED = 50000;
-const ticketKey = (() => {
-  const secret = process.env.BOARD_SECRET || process.env.ADMIN_KEY || '';
-  return secret.length >= 8 ? crypto.createHmac('sha256', 'nmsd-connection-tickets').update(secret).digest() : crypto.randomBytes(32);
-})();
+const ticketKey = require('./secrets').secretFor('connection-tickets', 'TICKET_HMAC_SECRET').key;   // Round 110 (sec110 H1)
 
 function ticketSig(uid, exp, nonce) { return crypto.createHmac('sha256', ticketKey).update('tk1|' + uid + '|' + exp + '|' + nonce).digest('hex').slice(0, 32); }
 
@@ -950,7 +975,7 @@ function admin(req, res) {
     const all = Object.values(state.players).sort((a, b) => String(b.created).localeCompare(String(a.created)));
     const term = String(q || '').trim().toLowerCase();
     const list = term ? all.filter(p => p.username.toLowerCase().includes(term) || String(p.email).includes(term) || (p.store && String(p.store.id).toLowerCase() === term)) : all;   // Round 109: + a store account id
-    const hidden = `<input type="hidden" name="key" value="${esc(key)}">`;
+    const hidden = require('./adminauth').hidden(key);   // Round 110: the session's CSRF token (key = that token now)
     const rows = list.slice(0, 500).map(p => {
       const k = esc(p.username.toLowerCase());
       return `<tr><td><b>${esc(p.username)}</b><br><span class="small">${esc(p.email)}</span></td>
@@ -982,18 +1007,10 @@ ${safe ? '' : '<p class="off">Accounts are NOT safe from a redeploy yet. Turn on
 ${list.length > 500 ? `<p class="small">Showing the newest 500 of ${list.length} - search, or download the CSV for everyone.</p>` : ''}`);
   };
 
-  if (req.method !== 'POST') {
-    pay.page(res, 200, 'Live accounts', `<h1>Live accounts</h1><form method="post" action="/admin/players"><p>Admin password:</p>
-<input type="password" name="key" autofocus> <button type="submit">Open</button></form>`);
-    return;
-  }
-
-  pay.readForm(req, 4 * 1024 * 1024).then(async form => {
-    const key = form.get('key') || '';
-    if (!pay.adminOk(key)) {
-      pay.page(res, 403, 'Live accounts', '<h1>Live accounts</h1><p>Wrong password (or ADMIN_KEY isn\'t set on the server).</p><a class="btn" href="/admin/players">Try again</a>');
-      return;
-    }
+  // Round 110: the admin session (adminauth.js) - sign-in, wrong-key limits, CSRF and the old key form all live there.
+  require('./adminauth').guard(req, res, { path: '/admin/players', limit: 4 * 1024 * 1024 }).then(async g => {
+    if (!g) return;
+    const form = g.form, key = g.token;
 
     if (!ready) { pay.page(res, 503, 'Live accounts', '<h1>Live accounts</h1><p>The server is still loading the accounts - refresh in a few seconds.</p>'); return; }
     const action = form.get('action') || '';
@@ -1171,4 +1188,4 @@ function gate(req, body, what) {
   return { ok: true, account: p.uid, username: p.username.toLowerCase() };   // Round 109: the account's uid (worlds go by it)
 }
 
-module.exports = { handle, check, required, isReady, gate, redeemTicket, isTicket, graceActive, uidOf, flush, final, adminSection, TERMS_VERSION, _test: { state: () => state, cleanUsername, validEmail, passwordProblem, seal, unseal, merge, cleanSwag, unionSwag, pickProgress, cleanDevice, legacyUid } };
+module.exports = { handle, check, required, isReady, gate, redeemTicket, isTicket, graceActive, uidOf, flush, final, adminSection, TERMS_VERSION, vaultKeyOk, vaultOn: () => vault.on, _test: { state: () => state, cleanUsername, validEmail, passwordProblem, seal, unseal, merge, cleanSwag, unionSwag, pickProgress, cleanDevice, legacyUid } };

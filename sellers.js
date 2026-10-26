@@ -626,21 +626,12 @@ ${waiting ? `<b class="on">${waiting} paid and waiting for you</b>` : 'None wait
 <form method="post" action="/admin/sellers">${hiddenKey}<input type="hidden" name="action" value="backup"><button type="submit">Download a backup (real shops)</button></form>`;
 }
 
-function admin(req, res, ip) {
+function admin(req, res, ip) {   // eslint-disable-line no-unused-vars
   const P = pay();
-  if (req.method !== 'POST') {
-    P.page(res, 200, 'Real shops', `<h1>Real shops</h1><form method="post" action="/admin/sellers"><p>Admin password:</p>
-<input type="password" name="key" autocomplete="current-password"> <button type="submit">Open</button></form>`);
-    return;
-  }
-  if (count('adminkey|' + ip, 600000) >= 10) { P.page(res, 429, 'Wait', '<h1>Too many wrong passwords</h1><p>Wait ten minutes and try again.</p>'); return; }
-  P.readForm(req, 64 * 1024).then(form => {
-    const key = form.get('key');
-    if (!P.adminOk(key)) {
-      note('adminkey|' + ip);
-      P.page(res, 403, 'Real shops', '<h1>Real shops</h1><p>Wrong password (or ADMIN_KEY isn\'t set on the server).</p><a class="btn" href="/admin/sellers">Try again</a>');
-      return;
-    }
+  // Round 110: the admin session (adminauth.js) - sign-in, wrong-key limits, CSRF and the old key form all live there.
+  require('./adminauth').guard(req, res, { path: '/admin/sellers', limit: 64 * 1024 }).then(g => {
+    if (!g) return;
+    const form = g.form, key = g.token;
     if (form.get('action') === 'backup') {   // the whole file (it has sellers' emails - keep it private)
       flush();
       res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store',
@@ -709,7 +700,7 @@ function linkTag(url) { return `<a href="${h(url)}" target="_blank" rel="noopene
 
 function adminHtml(key, msg, fee) {
   const t = Date.now();
-  const hiddenKey = `<input type="hidden" name="key" value="${h(key)}">`;
+  const hiddenKey = require('./adminauth').hidden(key);   // Round 110: the session's CSRF token (key = that token now)
   const parts = [CSS, '<h1>Real shops</h1>'];
   if (msg) parts.push(`<div class="code" style="font-size:15px;letter-spacing:0;text-align:left;white-space:pre-wrap">${h(msg)}</div>`);
   if (!PERSISTENT) parts.push('<div class="warn">Listings are forgotten when the free server restarts - add the $7 disk (STORE_DATA_DIR, see README.txt) before taking real money.</div>');

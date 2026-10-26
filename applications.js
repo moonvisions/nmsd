@@ -425,21 +425,12 @@ ${waiting ? `<b class="on">${waiting} waiting</b>` : 'None waiting'} &middot; ${
 <form method="post" action="/admin/applications">${hiddenKey}<button type="submit">Review applications${waiting ? ` (${waiting})` : ''}</button></form>`;
 }
 
-function admin(req, res, ip) {
+function admin(req, res, ip) {   // eslint-disable-line no-unused-vars
   const P = pay();
-  if (req.method !== 'POST') {
-    P.page(res, 200, 'Artist applications', `<h1>Artist applications</h1><form method="post" action="/admin/applications"><p>Admin password:</p>
-<input type="password" name="key" autocomplete="current-password"> <button type="submit">Open</button></form>`);
-    return;
-  }
-  if (count('adminkey|' + ip, 600000) >= 10) { P.page(res, 429, 'Wait', '<h1>Too many wrong passwords</h1><p>Wait ten minutes and try again.</p>'); return; }
-  P.readForm(req, 32 * 1024).then(form => {
-    const key = form.get('key');
-    if (!P.adminOk(key)) {
-      note('adminkey|' + ip);
-      P.page(res, 403, 'Artist applications', '<h1>Artist applications</h1><p>Wrong password (or ADMIN_KEY isn\'t set on the server).</p><a class="btn" href="/admin/applications">Try again</a>');
-      return;
-    }
+  // Round 110: the admin session (adminauth.js) - sign-in, wrong-key limits, CSRF and the old key form all live there.
+  require('./adminauth').guard(req, res, { path: '/admin/applications', limit: 32 * 1024 }).then(g => {
+    if (!g) return;
+    const form = g.form, key = g.token;
     let msg = '';
     try { msg = adminAction(String(form.get('action') || ''), form); } catch (err) { console.error('applications admin', err && err.message); msg = 'Something went wrong - try again.'; }
     P.page(res, 200, 'Artist applications', adminHtml(key, msg));
@@ -492,7 +483,7 @@ function adminAction(action, form) {
 
 function adminHtml(key, msg) {
   const now = Date.now();
-  const hiddenKey = `<input type="hidden" name="key" value="${h(key)}">`;
+  const hiddenKey = require('./adminauth').hidden(key);   // Round 110: the session's CSRF token (key = that token now)
   const parts = [CSS, '<h1>Artist applications</h1>'];
   if (msg) parts.push(`<div class="code" style="font-size:15px;letter-spacing:0;text-align:left;white-space:pre-wrap">${h(msg)}</div>`);
   if (!PERSISTENT) {

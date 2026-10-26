@@ -27,6 +27,8 @@ const reports = require('./reports');   // Round 57: players reported in online 
 const patchbay = require('./patchbay');   // Round 60: the DJ patch bay (/admin/patch) and the DJs' own page (/dj)
 const applications = require('./applications');   // Round 67: DJs / VJs / artists applying to play the Open Festival (/apply)
 const analytics = () => require('./analytics');   // Round 71: play stats (/admin/stats) - lazy, it requires this file too
+const auth = require('./adminauth');   // Round 110: one admin sign-in (a session cookie) for every /admin page
+const hub = () => require('./adminhub');   // Round 110: the admin home (/admin)
 
 const VENDORS_FILE = path.join(__dirname, 'vendors.json');
 const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';   // 32 letters: no 0/O or 1/I
@@ -179,7 +181,9 @@ function escapeHtml(s) {
 
 function page(res, status, title, body) {
   // Round 60: + never shown inside someone else's page (no clickjacking the admin buttons).
-  res.writeHead(status, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'referrer-policy': 'no-referrer',
+  // Round 110: referrer-policy same-origin (was no-referrer): with no-referrer browsers send "Origin: null" on a form post,
+  // and the admin pages' forms must show their own origin (the CSRF check). Other sites still get no referrer at all.
+  res.writeHead(status, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'referrer-policy': 'same-origin',
     'x-frame-options': 'DENY', 'content-security-policy': "frame-ancestors 'none'", 'x-content-type-options': 'nosniff' });
   res.end(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${escapeHtml(title)}</title>
@@ -190,7 +194,7 @@ a.btn,button{color:#111;background:#e8b14c;border:0;border-radius:6px;padding:9p
 table{width:100%;border-collapse:collapse}td{padding:8px;border-bottom:1px solid #2a2f3a;vertical-align:top}.small{font-size:13px;color:#8a93a3}
 .on{color:#6fd49a;font-weight:700}.off{color:#ff8a80;font-weight:700}input{padding:9px;border-radius:6px;border:1px solid #444;background:#1d212b;color:#fff;width:220px}
 select{padding:9px;border-radius:6px;border:1px solid #444;background:#1d212b;color:#fff}</style></head>
-<body><main>${body}</main></body></html>`);
+<body>${res.adminPage ? require('./adminui').chrome(res.adminPage.path, res.adminPage.token) : ''}<main>${body}</main></body></html>`);   // Round 110: + the admin top bar on signed-in admin pages
 }
 
 function readForm(req, limit) {
@@ -220,6 +224,9 @@ function handle(req, res) {
   }
 
   const route = url.pathname;
+
+  // Round 110: /admin/login and /admin/logout (adminauth.js) - before anything else.
+  if (auth.handle(req, res)) return true;
 
   // Round 55: the Moon Shards store, accounts and the vendor portal (/store/..., /vendor).
   if (store.handle(req, res)) return true;
@@ -328,19 +335,20 @@ It works on up to 2 of your devices.</p>`);
     return true;
   }
 
-  // ---- Your admin page (password form, then a cookie-free session in the form posts). ----
-  if (route === '/admin') {
-    if (req.method !== 'POST') {
-      page(res, 200, 'Festival Tycoon admin', `<h1>Festival Tycoon admin</h1>
-<form method="post" action="/admin"><p>Admin password:</p><input type="password" name="key" autocomplete="current-password"> <button type="submit">Open</button></form>`);
-      return true;
-    }
-
-    readForm(req, 4096).then(form => {
-      const key = form.get('key');
-      if (!adminOk(key)) { page(res, 403, 'Admin', '<h1>Admin</h1><p>Wrong password.</p><a class="btn" href="/admin">Try again</a>'); return; }
+  // ---- Your admin pages. Round 110: /admin is the admin home (adminhub.js) behind one sign-in (adminauth.js); this
+  // store & payments page moved to /admin/store. The store's own buttons still post to /admin with an "action" (store.js,
+  // community.js, reports.js and the patch bay's sections build those forms) - those land here and show this page again.
+  if (route === '/admin' || route === '/admin/store') {
+    auth.guard(req, res, { path: route, limit: 8192 }).then(g => {
+      if (!g) return;
+      const form = g.form;
       const action = form.get('action');
-      if (action === 'onboard') return onboard(res, form.get('venue'), key);
+      if (!action) {
+        if (route === '/admin') return hub().render(req, res, g.token);
+        return adminPage(res, g.token, '');
+      }
+      res.adminPage = { path: '/admin/store', token: g.token };   // (a store action: shown as the store page)
+      if (action === 'onboard') return onboard(res, form.get('venue'), g.token);
       if (action === 'store-backup') {   // Round 55: the store's backup, as a file download
         res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store',
           'content-disposition': `attachment; filename="store-backup-${new Date().toISOString().slice(0, 10)}.json"` });
@@ -350,7 +358,7 @@ It works on up to 2 of your devices.</p>`);
       let note = reports.adminAction(action, form);   // Round 57: player reports from online rooms
       if (note === null) note = store.adminAction(action, form);   // Round 55: vendors, designs, reports, shards
       if (note === null) community.adminAction(action, String(form.get('item') || ''));   // Round 45: approve / reject players' creations
-      return adminPage(res, key, note);
+      return adminPage(res, g.token, note);
     }).catch(err => fail(res, err, 'admin'));
     return true;
   }
@@ -361,7 +369,7 @@ It works on up to 2 of your devices.</p>`);
 let liveEvents = null;   // the relay tells us which events have their room open (Round 50)
 function setLiveEvents(set) { liveEvents = set; }
 
-function adminPage(res, key, note) {
+function adminPage(res, token, note) {
   const s = stripe();
   const on = features();
   const list = venues();
@@ -369,7 +377,7 @@ function adminPage(res, key, note) {
     ? s.accounts.retrieve(String(v.stripeAccount)).then(a => a.charges_enabled).catch(() => null)
     : Promise.resolve(null));
   Promise.all(checks).then(ready => {
-    const hidden = `<input type="hidden" name="key" value="${escapeHtml(key)}">`;
+    const hidden = auth.hidden(token);   // Round 110: the session's CSRF token (was the admin key itself)
     const rows = list.map((v, i) => {
       const id = cleanId(v.id);
       const price = Number(v.ticketPrice);
@@ -382,7 +390,7 @@ function adminPage(res, key, note) {
 <button type="submit">${v.stripeAccount ? 'New sign-up link' : 'Set up payouts'}</button></form></td></tr>`;
     }).join('');
     const example = 500;
-    page(res, 200, 'Festival Tycoon admin', `<h1>Festival Tycoon admin</h1>
+    page(res, 200, 'Store & payments', `<p class="small"><a href="/admin/store" style="color:#e8b14c">Refresh</a></p><h1>Store &amp; payments</h1>
 ${note ? `<div class="code" style="font-size:15px;letter-spacing:0;text-align:left">${escapeHtml(note)}</div>` : ''}
 <h2>Special features</h2>
 <p>These are OFF unless you switch them on, so the game stays the festival tycoon career plus the multiplayer festival.</p>
@@ -415,7 +423,7 @@ ${community.adminSection(hidden)}`);
   }).catch(err => fail(res, err, 'admin-page'));
 }
 
-function onboard(res, venueId, key) {
+function onboard(res, venueId, token) {
   const s = stripe();
   const base = baseUrl();
   const venue = findVenue(venueId);
@@ -440,7 +448,7 @@ The link keeps working, so they can come back to it:</p>
 <div class="code" style="font-size:14px;letter-spacing:0">${escapeHtml(link)}</div>
 <p><b>2.</b> In vendors.json, add this to the ${escapeHtml(venue.name)} venue (inside its { }), set the ticket price, then commit:</p>
 <div class="code" style="font-size:15px;letter-spacing:0">"stripeAccount": "${escapeHtml(account)}", "ticketPrice": 5.00</div>
-<form method="post" action="/admin"><input type="hidden" name="key" value="${escapeHtml(key)}"><button type="submit">Back to the admin page</button></form>`);
+<p><a class="btn" href="/admin/store">Back to store &amp; payments</a></p>`);
   }).catch(err => {
     console.error('onboard', err && err.message);
     page(res, 502, 'Admin', `<h1>Stripe said no</h1><p>${escapeHtml(err && err.message)}</p><p class="small">Is Connect switched on in your Stripe dashboard?</p>`);
