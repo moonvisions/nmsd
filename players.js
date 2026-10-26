@@ -47,6 +47,34 @@
 //   3. The admin page's "Download full backup" - keep a copy somewhere safe now and then; "Restore" merges one back.
 //
 // LIVE_SIGNUP_REQUIRED=0 (Render > Environment) lets copies of the game without accounts into /public (default: required).
+//
+// Round 109 - THE ACCOUNT IS THE KEY TO EVERYTHING ONLINE (the owner: "In order to play online, you must make a username +
+// password + email... make sure the server and game always tracks and maintains their account when they log in/open the
+// game"). Every online room now needs a live account too (relay.js: /host, /join?code=, /join?event=, saved worlds;
+// worlds.js: /worlds/*). LIVE_SIGNUP_REQUIRED=0 is still the one switch that turns all of it off.
+//   GET  /players/status           -> {ok, ready, required}          (no sign-in needed: may this game skip the account?)
+//   GET  /players/me?device=...    -> + required; "device" (platform and version, e.g. "Android 1.9.2") is kept as the
+//                                     account's LAST DEVICE for the admin page (signup / signin take {device} too)
+//   POST /players/progress         + identity (the character - the game's own JSON text, at most 16 KB) and swag (the
+//                                     swag unlock ids). An older game that sends no identity never wipes the stored one,
+//                                     and swag is a UNION on the server: an unlock, once sent, is never lost (it's even
+//                                     taken in when the rest of the save is stale). Body limit 128 KB (was 96).
+//   POST /players/store-link       Bearer + {store: "<store account id>.<its device token>" or "", create: true}
+//                                  -> {ok, store, token?, account?, parked?, foreign?, created?, swapped?} - the Moon Shards
+//                                     store account that belongs to this live account (store.js linkLive: one store account
+//                                     per live account; two people's balances are never merged).
+//
+// Round 109 (security review):
+//  - Every account has an immutable random UID (p.uid, made at sign-up; older accounts get one worked out the same way on
+//    every server from their username + created time, and saved). Store accounts, saved worlds and backup merges are keyed
+//    on the UID, never the username: a deleted username signed up again is a NEW person and inherits nothing - not the
+//    store account, the character, the swag or the worlds. Deleted UIDs are tombstoned forever (state.deletedUids).
+//  - Deleting an account (the player or the admin) also deletes their saved worlds (worlds.js removeOwnedBy).
+//  - POST /players/ticket (Bearer) -> {ok, ticket, expires}: a single-use key, good for 60 s, for one connection - the
+//    game puts that in the WebSocket address (?pt=) instead of its long-lived sign-in key (relay.js).
+//  - LIVE_ACCOUNT_GRACE_UNTIL=<ISO date> (optional): until then, older games (no account at all) may still host and join
+//    rooms and use worlds / the world boards, so the server can go out before every player has updated. /players/status
+//    says {grace, graceUntil}. (The Open Festival needed accounts already and isn't affected.)
 
 const fs = require('fs');
 const path = require('path');
@@ -60,8 +88,13 @@ const FILE = path.join(DIR, 'players.json');
 const BAK = FILE + '.bak';
 const MAX_PLAYERS = 500000;
 const MAX_TOKENS = 8;
-const MAX_PROGRESS_BODY = 96 * 1024;   // Round 75: one progress sync (both blobs together)
+const MAX_PROGRESS_BODY = 128 * 1024;  // Round 75: one progress sync (both blobs together). Round 109: 128 KB (+ identity, swag)
 const MAX_ROLE = 16;
+const MAX_IDENTITY = 16 * 1024;        // Round 109: the character (PlayerIdentity + the look) - a few KB in practice
+const MAX_SWAG = 256;                  // Round 109: swag unlock ids kept per account
+const SWAG_ID = /^[a-z0-9][a-z0-9-]{1,31}$/;
+const MAX_STORE_OTHERS = 6;            // Round 109: other store accounts seen with this live account (for the admin)
+const S = () => require('./store');    // Round 109 (lazy, like payments)
 const PROGRESS_GAP = 15000;            // one progress write per account this often
 const TERMS_VERSION = '2026-10-14';
 const CONTACT = process.env.CONTACT_EMAIL || 'daniel@moonvisionmedia.com';
@@ -70,6 +103,7 @@ const COMPANY = 'Moon Vision Media LLC';
 let state = { version: 2, savedAt: '', players: {} };   // key: lower-case username
 let byEmail = new Map();   // email -> key
 let byToken = new Map();   // token hash -> key
+let byUid = new Map();     // Round 109: uid -> key (connection tickets name the uid)
 let dirty = false;
 let ready = false;         // the newest copy (disk / GitHub) has been loaded
 let loadNote = '';
@@ -89,13 +123,30 @@ function readFile(file) {
 function index() {
   byEmail = new Map();
   byToken = new Map();
+  byUid = new Map();
   for (const [key, p] of Object.entries(state.players)) {
     if (p.email) byEmail.set(p.email, key);
     for (const t of p.tokens || []) byToken.set(t, key);
+    if (p.uid) byUid.set(p.uid, key);
   }
 }
 
 function count(data) { return data && data.players ? Object.keys(data.players).length : 0; }
+
+// Round 109 (review H1): the account's own identity, separate from its (re-usable) username.
+const UID_RE = /^u[0-9a-f]{24}$/;
+function newUid() { return 'u' + crypto.randomBytes(12).toString('hex'); }
+/** An account from before uids: the same uid on every server and every backup (username + when it was made). */
+function legacyUid(key, p) { return 'u' + crypto.createHash('sha256').update('nmsd-legacy-uid|' + String(key).toLowerCase() + '|' + String((p && p.created) || '')).digest('hex').slice(0, 24); }
+function uidOf(key, p) { return p && typeof p.uid === 'string' && UID_RE.test(p.uid) ? p.uid : legacyUid(key, p); }
+/** Gives every account without one its uid (deterministic, so two servers agree). How many were given one. */
+function backfillUids() {
+  let n = 0;
+  for (const [k, p] of Object.entries(state.players)) {
+    if (p && p.uid !== uidOf(k, p)) { p.uid = uidOf(k, p); n++; }
+  }
+  return n;
+}
 
 function newer(a, b) {
   if (!a) return b;
@@ -229,7 +280,9 @@ async function load() {
   if (best) state = best;
   state.players = state.players || {};
   state.deletedKeys = state.deletedKeys || {};
+  state.deletedUids = state.deletedUids || {};   // Round 109: deleted accounts, forever (a backup never brings one back)
   state.version = 2;
+  if (backfillUids()) dirty = true;               // Round 109: (saved by the next flush)
   index();
   ready = true;
   console.log(`players: ${count(state)} live accounts loaded${persistent() ? ' (disk)' : ''}${vault.on ? (vault.loaded ? ' (GitHub backup on)' : ' (GitHub backup NOT reachable)') : ''}`);
@@ -318,33 +371,55 @@ async function push() {
 function merge(data, quiet) {
   if (!data || !data.players || typeof data.players !== 'object') return 0;
   state.deletedKeys = state.deletedKeys || {};
+  state.deletedUids = state.deletedUids || {};
   for (const [k, at] of Object.entries(data.deletedKeys || {})) {
     if (!state.deletedKeys[k] || state.deletedKeys[k] < at) state.deletedKeys[k] = at;
+  }
+  for (const [u, at] of Object.entries(data.deletedUids || {})) {   // Round 109
+    if (UID_RE.test(u) && (!state.deletedUids[u] || state.deletedUids[u] < at)) state.deletedUids[u] = at;
   }
   let n = 0;
   for (const [key, p] of Object.entries(data.players)) {
     if (!p || typeof p !== 'object' || !p.username || !p.email) continue;
     const k = String(p.username).toLowerCase();
     if (k !== key.toLowerCase()) continue;
+    // Round 109 (review H1): the same PERSON, not just the same username. A record whose uid (or, for a record from before
+    // uids, whose created time - it's part of the worked-out uid) differs is someone else and is never mixed in.
+    const uid = uidOf(k, p);
+    if (state.deletedUids[uid]) continue;   // that person deleted their account: never back
     const stamp = Date.parse(p.updated || p.created || '') || 0;
+    const created = Date.parse(p.created || '') || 0;
     const gone = Date.parse(state.deletedKeys[k] || '') || 0;
-    if (gone && gone >= stamp) continue;   // deleted after this copy was made
+    if (gone && gone >= stamp && created <= gone) continue;   // deleted after this copy was made (an older record of the name)
     const mine = state.players[k];
+    if (mine && uidOf(k, mine) !== uid) continue;   // a different person has this username here now
     if (mine && (Date.parse(mine.updated || mine.created || '') || 0) >= stamp) {
       // Round 75: my copy of the account stays, but their saved game may still be newer (synced on the other server).
-      if (newerProgress(p.progress, mine.progress)) { mine.progress = p.progress; n++; }
+      // Round 109: the newer saved game, with both copies' swag (a union - never lost) and the store link if mine has none
+      // (the same person - checked just above).
+      const both = pickProgress(mine.progress, p.progress);
+      if (both && JSON.stringify(both) !== JSON.stringify(mine.progress)) { mine.progress = both; n++; }
+      if (!mine.store && p.store) { mine.store = p.store; n++; }
       continue;
     }
     const other = byEmail.get(p.email);
     if (other && other !== k) continue;   // that email is someone else's here
-    if (mine && newerProgress(mine.progress, p.progress)) p.progress = mine.progress;   // (their account, my newer saved game)
+    if (mine) {
+      const both = pickProgress(mine.progress, p.progress);   // (the same person: the newer saved game - Round 109: + both swags)
+      if (both) p.progress = both;
+      if (!p.store && mine.store) p.store = mine.store;
+    }
+    p.uid = uid;
     state.players[k] = p;
     n++;
   }
-  // Accounts deleted elsewhere (the other server) go here too.
-  for (const [k, at] of Object.entries(state.deletedKeys)) {
-    const mine = state.players[k];
-    if (mine && (Date.parse(mine.updated || mine.created || '') || 0) <= (Date.parse(at) || 0)) { delete state.players[k]; n++; }
+  // Accounts deleted elsewhere (the other server) go here too - by uid; for an old tombstone by name, only the account
+  // that existed then (one made after it was deleted is a new person).
+  for (const [k, mine] of Object.entries(state.players)) {
+    const u = uidOf(k, mine);
+    const at = Date.parse(state.deletedKeys[k] || '') || 0;
+    const madeAt = Date.parse(mine.created || '') || 0;
+    if (state.deletedUids[u] || (at && madeAt <= at && (Date.parse(mine.updated || mine.created || '') || 0) <= at)) { delete state.players[k]; n++; }
   }
   index();
   if (n) { dirty = true; if (!quiet) vaultSoon(4000); }
@@ -356,6 +431,13 @@ load();
 // ------------------------------------------------------------------ helpers
 
 function required() { return process.env.LIVE_SIGNUP_REQUIRED !== '0'; }
+
+/** Round 109 (review M5): LIVE_ACCOUNT_GRACE_UNTIL=<ISO date> - until then older games without accounts may still play rooms. */
+function graceUntil() {
+  const t = Date.parse(String(process.env.LIVE_ACCOUNT_GRACE_UNTIL || '').trim());
+  return Number.isFinite(t) ? t : 0;
+}
+function graceActive() { return graceUntil() > Date.now(); }
 function persistent() { return !!process.env.STORE_DATA_DIR; }
 function isReady() { return ready; }
 
@@ -469,17 +551,57 @@ function cleanProgress(v) {
   if (!v || typeof v !== 'object') return null;
   const stamp = Number(v.stamp);
   if (!Number.isFinite(stamp) || stamp < 0) return null;
-  return { stamp: Math.floor(stamp), social: typeof v.social === 'string' ? v.social : '', progress: typeof v.progress === 'string' ? v.progress : '', role: String(v.role || '').slice(0, MAX_ROLE), at: v.at || now() };
+  return {
+    stamp: Math.floor(stamp), social: typeof v.social === 'string' ? v.social : '', progress: typeof v.progress === 'string' ? v.progress : '', role: String(v.role || '').slice(0, MAX_ROLE),
+    identity: typeof v.identity === 'string' && v.identity.length <= MAX_IDENTITY ? v.identity : '',   // Round 109
+    swag: cleanSwag(v.swag),                                                                          // Round 109
+    at: v.at || now()
+  };
 }
 
-function newerProgress(a, b) {
+/** Round 109: swag unlock ids - short lower-case ids, no repeats, at most MAX_SWAG. Anything else is dropped. */
+function cleanSwag(list) {
+  if (!Array.isArray(list)) return [];
+  const out = [];
+  for (const id of list) {
+    if (out.length >= MAX_SWAG) break;
+    if (typeof id === 'string' && SWAG_ID.test(id) && !out.includes(id)) out.push(id);
+  }
+  return out;
+}
+
+/** Round 109: the union of two swag lists (an unlock is never lost, whichever copy wins). */
+function unionSwag(a, b) { return cleanSwag(cleanSwag(a).concat(cleanSwag(b))); }
+
+/** Round 109: two stored saved games -> the newer one (by stamp), carrying both swags and, if it has none, the other's identity. */
+function pickProgress(a, b) {
   const pa = cleanProgress(a), pb = cleanProgress(b);
-  return !!pa && (!pb || pa.stamp > pb.stamp);
+  if (!pa && !pb) return null;
+  const win = !pb || (pa && pa.stamp >= pb.stamp) ? pa : pb;
+  const lose = win === pa ? pb : pa;
+  const out = Object.assign({}, win);
+  if (lose) {
+    out.swag = unionSwag(win.swag, lose.swag);
+    if (!out.identity && lose.identity) out.identity = lose.identity;
+  }
+  return out;
 }
 
 function progressOf(p) {
   const s = cleanProgress(p && p.progress);
-  return s ? { stamp: s.stamp, social: s.social, progress: s.progress, role: s.role } : { stamp: 0, social: '', progress: '', role: '' };
+  return s ? { stamp: s.stamp, social: s.social, progress: s.progress, role: s.role, identity: s.identity, swag: s.swag }
+    : { stamp: 0, social: '', progress: '', role: '', identity: '', swag: [] };
+}
+
+/** Round 109: what a game says it is ("Android 1.9.2", "Windows 1.9.2") - letters, numbers and a few signs, 48 at most. */
+function cleanDevice(text) { return String(text || '').replace(/[^A-Za-z0-9 ._()\/+-]/g, '').replace(/\s+/g, ' ').trim().slice(0, 48); }
+
+function noteDevice(p, device) {
+  const d = cleanDevice(device);
+  if (!d) return false;
+  const changed = !p.device || p.device.name !== d;
+  p.device = { name: d, at: now() };
+  return changed;
 }
 
 /** Reads a JSON body up to <limit> bytes: the parsed object, {} if it isn't JSON, or null when it's too big (so the caller can say 413). */
@@ -511,14 +633,26 @@ function progressRoute(req, res) {
     if (!incoming || !incoming.stamp) { json(res, 400, { ok: false, error: 'stamp (ms since epoch), social, progress and role are needed' }); return; }
     if (typeof body.social !== 'string' || typeof body.progress !== 'string') { json(res, 400, { ok: false, error: 'social and progress must be strings' }); return; }
     if (String(body.role || '').length > MAX_ROLE) { json(res, 400, { ok: false, error: 'role is too long' }); return; }
+    // Round 109: the character rides along (optional - an older game sends none, and then the stored one is kept).
+    if (body.identity !== undefined && typeof body.identity !== 'string') { json(res, 400, { ok: false, error: 'identity must be a string' }); return; }
+    if (typeof body.identity === 'string' && body.identity.length > MAX_IDENTITY) { json(res, 413, { ok: false, error: 'identity is too big' }); return; }
+    if (body.swag !== undefined && !Array.isArray(body.swag)) { json(res, 400, { ok: false, error: 'swag must be a list' }); return; }
     const stored = cleanProgress(p.progress);
-    if (stored && stored.stamp > incoming.stamp) { json(res, 200, Object.assign({ ok: false, stale: true }, progressOf(p))); return; }   // (the game decides)
+    const swag = unionSwag(stored ? stored.swag : [], body.swag);
+    if (stored && stored.stamp > incoming.stamp) {
+      // (the game decides) - Round 109: but a new swag unlock is never turned away: it joins the stored copy now.
+      if (swag.length > stored.swag.length) { p.progress.swag = swag; save(30000); }
+      json(res, 200, Object.assign({ ok: false, stale: true }, progressOf(p)));
+      return;
+    }
     if (peek('prog|' + key, 1, PROGRESS_GAP)) { json(res, 429, { ok: false, error: 'slow down' }); return; }
     limited('prog|' + key, 1, PROGRESS_GAP);
-    p.progress = { stamp: incoming.stamp, social: incoming.social, progress: incoming.progress, role: incoming.role, at: now() };
+    // Round 109 (review L6): an empty identity never replaces a stored one (only a real character does).
+    const identity = typeof body.identity === 'string' && body.identity.length > 0 ? body.identity : (stored ? stored.identity : '');
+    p.progress = { stamp: incoming.stamp, social: incoming.social, progress: incoming.progress, role: incoming.role, identity, swag, at: now() };
     p.seen = now();
     save(30000);
-    json(res, 200, { ok: true, stamp: incoming.stamp });
+    json(res, 200, { ok: true, stamp: incoming.stamp, swag });   // Round 109: + the account's swag (the union)
   }).catch(err => {
     console.error('players progress', err && err.message);
     json(res, 500, { ok: false, error: 'try again' });
@@ -547,17 +681,31 @@ function handle(req, res) {
     return true;
   }
 
+  // Round 109: may a game play online without an account here? (LIVE_SIGNUP_REQUIRED=0 - the one switch.) Answered while
+  // the accounts are still loading too, so a game never waits on it.
+  if (route === '/players/status') {
+    if (peek('status|' + ipOf(req), 60, 60000)) { json(res, 429, { ok: false, message: 'Slow down a little.' }); return true; }
+    limited('status|' + ipOf(req), 60, 60000);
+    json(res, 200, { ok: true, ready, required: required(), grace: required() && graceActive(), graceUntil: graceUntil() ? new Date(graceUntil()).toISOString() : '' });   // Round 109: + the grace switch
+    return true;
+  }
+
   if (!ready) { json(res, 503, { ok: false, message: 'The server is starting up - try again in a few seconds.' }); return true; }
   const ip = ipOf(req);
 
   if (route === '/players/progress') { progressRoute(req, res); return true; }   // Round 75 (its own body limit and GET + POST)
 
+  if (route === '/players/ticket') { ticketRoute(req, res, ip); return true; }   // Round 109 (review L4)
+
   if (route === '/players/me') {
     const p = byBearer(req);
-    if (!p) { json(res, 401, { ok: false, message: 'Please sign in again.' }); return true; }
+    if (!p) { json(res, 401, { ok: false, message: 'Please sign in again.', required: required() }); return true; }
     p.seen = now();
-    save(false);
-    json(res, 200, { ok: true, username: p.username, email: p.email, termsOk: !!(p.terms && p.terms.version === TERMS_VERSION), terms: TERMS_VERSION });
+    // Round 109: the game says what it is (the admin page's "last device"); a new device is worth an off-site backup soon.
+    let device = '';
+    try { device = new URL(req.url, 'http://x').searchParams.get('device') || ''; } catch { /* */ }
+    save(noteDevice(p, device) ? 60000 : false);
+    json(res, 200, { ok: true, username: p.username, email: p.email, uid: p.uid, termsOk: !!(p.terms && p.terms.version === TERMS_VERSION), terms: TERMS_VERSION, required: required(), store: p.store ? p.store.id : '' });
     return true;
   }
 
@@ -589,14 +737,18 @@ async function route2(route, req, res, body, ip) {
       if (Object.keys(state.players).length >= MAX_PLAYERS) return json(res, 503, { ok: false, message: 'Sign-ups are full right now.' });
       const pass = await hashPassword(body.password);
       if (state.players[key] || byEmail.get(email)) return json(res, 409, { ok: false, field: 'username', message: 'That was just taken - try again.' });
-      const p = { username, email, pass, created: now(), updated: now(), seen: now(), terms: { version: TERMS_VERSION, at: now(), age13: true }, tokens: [] };
+      // Round 109: + an immutable uid - this person, not this username (store accounts, worlds and merges go by it).
+      const p = { uid: newUid(), username, email, pass, created: now(), updated: now(), seen: now(), terms: { version: TERMS_VERSION, at: now(), age13: true }, tokens: [] };
+      noteDevice(p, body.device);   // Round 109
       state.players[key] = p;
       byEmail.set(email, key);
+      byUid.set(p.uid, key);   // Round 109
       const token = newToken(p);
       limited('up|' + ip, 20, 3600000);   // (only accounts actually made count)
-      if (state.deletedKeys) delete state.deletedKeys[key];
+      // Round 109 (review H1): the old tombstone for this name STAYS - it only ever matches the deleted person's records
+      // (made before it), so nothing of theirs can come back into this new account from a backup.
       save();
-      return json(res, 200, { ok: true, username, email, token });
+      return json(res, 200, { ok: true, username, email, token, uid: p.uid });
     }
 
     case '/players/signin': {
@@ -613,8 +765,8 @@ async function route2(route, req, res, body, ip) {
       if (!p || !okPass) return json(res, 401, { ok: false, field: 'password', message: `That username / email and password don't match. Forgot your password? Email ${CONTACT} and we'll reset it.` });
       const token = newToken(p);
       p.seen = now();
-      save(false);
-      return json(res, 200, { ok: true, username: p.username, email: p.email, token, termsOk: !!(p.terms && p.terms.version === TERMS_VERSION) });
+      save(noteDevice(p, body.device) ? 60000 : false);   // Round 109: + the last device
+      return json(res, 200, { ok: true, username: p.username, email: p.email, token, uid: p.uid, termsOk: !!(p.terms && p.terms.version === TERMS_VERSION) });
     }
 
     case '/players/password': {
@@ -654,6 +806,8 @@ async function route2(route, req, res, body, ip) {
       return json(res, 200, { ok: true });
     }
 
+    case '/players/store-link': return storeLink(req, res, body, ip);   // Round 109
+
     case '/players/delete': {
       const p = byBearer(req);
       if (!p) return json(res, 401, { ok: false, message: 'Please sign in again.' });
@@ -666,14 +820,122 @@ async function route2(route, req, res, body, ip) {
   return json(res, 404, { ok: false });
 }
 
+// ------------------------------------------------------------------ Round 109: the Moon Shards store account that belongs to a live account
+//
+// Moon Shards and premium items live on a STORE account (store.js), which used to be a thing of its own (a display name and
+// a recovery code). Now each live account has at most ONE store account, linked here (p.store) and on the store account
+// itself (its "live" owner), and the game asks for it at every sign-in - so the shards follow the username to any device
+// with nothing to type. The rules are in store.js linkLive; in short: link a device's store account only when it belongs
+// to nobody yet; a store account linked to someone else is never handed to this account; two different store accounts are
+// NEVER merged here (a human - the admin - can move shards if one person really has two).
+const MAX_STORE_BODY = 1024;
+
+function storeLink(req, res, body, ip) {
+  const p = byBearer(req);
+  if (!p) return json(res, 401, { ok: false, message: 'Please sign in again.', required: required() });
+  // Round 109 (review L5): per account AND per network, like /store/account/create - and making a NEW store account this
+  // way counts against the very same limit as making one in the Store (5 an hour from one network).
+  if (peek('slink|' + p.uid, 10, 3600000) || peek('slinkip|' + ip, 30, 3600000)) return json(res, 429, { ok: false, message: 'Slow down a little.' });
+  limited('slink|' + p.uid, 10, 3600000);
+  limited('slinkip|' + ip, 30, 3600000);
+  const device = typeof body.store === 'string' && body.store.length <= MAX_STORE_BODY ? body.store : '';
+  let out;
+  try {
+    out = S().linkLive(p.uid, p.store ? p.store.id : '', device, { create: body.create === true, adopt: body.adopt === true, name: p.username, email: p.email, ip });
+  } catch (err) {
+    console.error('players store-link', err && err.message);
+    return json(res, 500, { ok: false, message: 'Something went wrong - try again in a minute.' });
+  }
+  if (!out || !out.ok) return json(res, out && out.status === 429 ? 429 : 200, Object.assign({ ok: false }, out || {}));
+  let changed = false;
+  const was = p.store ? p.store.id : '';
+  if (out.store && out.store !== was) { p.store = { id: out.store, at: now() }; changed = true; }
+  else if (!out.store && was && out.unlinked) { delete p.store; changed = true; }
+  // (for the admin: other store accounts seen with this person - kept apart, never merged. Round 109 (review M3): + the one
+  // let go in a swap, so it can always be found again.)
+  for (const other of [out.parked && out.parked.id, out.replaced]) {
+    if (!other) continue;
+    const others = Array.isArray(p.storeOthers) ? p.storeOthers.filter(o => o && o.id !== other) : [];
+    others.unshift({ id: other, at: now() });
+    p.storeOthers = others.slice(0, MAX_STORE_OTHERS);
+    changed = true;
+  }
+  if (changed) { p.updated = now(); save(); }
+  const reply = Object.assign({}, out);
+  delete reply.status;
+  return json(res, 200, reply);
+}
+
+// ------------------------------------------------------------------ Round 109 (review L4): single-use connection tickets
+//
+// The game used to put its long-lived sign-in key in the WebSocket address (?pt=), where proxies and logs can see it. Now it
+// asks for a TICKET first: good for 60 seconds (LIVE_TICKET_SECONDS), for this account only, used once. A ticket is SIGNED
+// (HMAC, with a key worked out from BOARD_SECRET, else ADMIN_KEY - both already set on Render; else a random one for this
+// run), so any copy of this server accepts it - e.g. the new one during a redeploy overlap. Each copy remembers the tickets
+// it has seen used. A ticket that's unknown, used or out of date is refused as "ticket: ..." (the game fetches a new one
+// and tries again - it never signs anyone out over it).
+const TICKET_MS = Math.max(1000, Math.min(600000, (Number(process.env.LIVE_TICKET_SECONDS) || 60) * 1000));
+const TICKET_RE = /^tk1-(u[0-9a-f]{24})-([0-9a-z]{1,12})-([0-9a-f]{16})-([0-9a-f]{32})$/;
+const usedTickets = new Map();   // nonce -> expiry (used here)
+const MAX_USED = 50000;
+const ticketKey = (() => {
+  const secret = process.env.BOARD_SECRET || process.env.ADMIN_KEY || '';
+  return secret.length >= 8 ? crypto.createHmac('sha256', 'nmsd-connection-tickets').update(secret).digest() : crypto.randomBytes(32);
+})();
+
+function ticketSig(uid, exp, nonce) { return crypto.createHmac('sha256', ticketKey).update('tk1|' + uid + '|' + exp + '|' + nonce).digest('hex').slice(0, 32); }
+
+/** It has the shape of a connection ticket (whether or not it's still good). */
+function isTicket(text) { return typeof text === 'string' && TICKET_RE.test(text); }
+
+function ticketRoute(req, res, ip) {
+  if (req.method !== 'POST') { json(res, 405, { ok: false }); return; }
+  const p = byBearer(req);
+  if (!p) { json(res, 401, { ok: false, signin: true, message: 'Please sign in again.', required: required() }); return; }
+  if (peek('ticket|' + p.uid, 60, 600000) || peek('ticketip|' + ip, 200, 600000)) { json(res, 429, { ok: false, message: 'Slow down a little.' }); return; }
+  limited('ticket|' + p.uid, 60, 600000);
+  limited('ticketip|' + ip, 200, 600000);
+  const exp = (Date.now() + TICKET_MS).toString(36);
+  const nonce = crypto.randomBytes(8).toString('hex');
+  const ticket = `tk1-${p.uid}-${exp}-${nonce}-${ticketSig(p.uid, exp, nonce)}`;
+  json(res, 200, { ok: true, ticket, expires: Date.now() + TICKET_MS });
+}
+
+/** A connection ticket -> its account (used up here), or null (bad, used, expired, or the account is gone). */
+function redeemTicket(ticket) {
+  if (!ready || !isTicket(ticket)) return null;
+  const [, uid, exp, nonce, sig] = TICKET_RE.exec(ticket);
+  const want = Buffer.from(ticketSig(uid, exp, nonce)), got = Buffer.from(sig);
+  if (want.length !== got.length || !crypto.timingSafeEqual(want, got)) return null;
+  const until = parseInt(exp, 36);
+  const t = Date.now();
+  if (!Number.isFinite(until) || until < t || until > t + TICKET_MS + 5000) return null;
+  if (usedTickets.has(nonce)) return null;
+  if (usedTickets.size >= MAX_USED) for (const [n, e] of usedTickets) if (e < t) usedTickets.delete(n);
+  usedTickets.set(nonce, until);
+  const key = byUid.get(uid);
+  const p = key ? state.players[key] : null;
+  return p && p.uid === uid && !(state.deletedUids && state.deletedUids[uid]) ? p : null;
+}
+
+setInterval(() => { const t = Date.now(); for (const [n, e] of usedTickets) if (e < t) usedTickets.delete(n); }, 60000).unref();
+
 function removeAccount(key) {
   const p = state.players[key];
   if (!p) return false;
+  const uid = uidOf(key, p);
+  // Round 109: the store account stays (it holds purchases) - it just isn't this live account's any more.
+  if (p.store && p.store.id) { try { S().unlinkLive(uid, p.store.id); } catch (err) { console.error('players unlink', err && err.message); } }
+  // Round 109 (review M1): their saved worlds are deleted with the account ("removed from our server straight away").
+  try { require('./worlds').removeOwnedBy(uid); } catch (err) { console.error('players worlds', err && err.message); }
   dropTokens(p);
+  byUid.delete(uid);   // (its tickets stop working at once)
   if (p.email && byEmail.get(p.email) === key) byEmail.delete(p.email);
   delete state.players[key];
   state.deletedKeys = state.deletedKeys || {};
   state.deletedKeys[key] = now();   // (so no backup ever brings it back)
+  state.deletedUids = state.deletedUids || {};
+  state.deletedUids[uid] = now();   // Round 109: this person, forever (a new sign-up with the same name is someone else)
   save();
   return true;
 }
@@ -687,12 +949,13 @@ function admin(req, res) {
   const show = (key, q, note) => {
     const all = Object.values(state.players).sort((a, b) => String(b.created).localeCompare(String(a.created)));
     const term = String(q || '').trim().toLowerCase();
-    const list = term ? all.filter(p => p.username.toLowerCase().includes(term) || String(p.email).includes(term)) : all;
+    const list = term ? all.filter(p => p.username.toLowerCase().includes(term) || String(p.email).includes(term) || (p.store && String(p.store.id).toLowerCase() === term)) : all;   // Round 109: + a store account id
     const hidden = `<input type="hidden" name="key" value="${esc(key)}">`;
     const rows = list.slice(0, 500).map(p => {
       const k = esc(p.username.toLowerCase());
       return `<tr><td><b>${esc(p.username)}</b><br><span class="small">${esc(p.email)}</span></td>
 <td class="small">joined ${esc(String(p.created).slice(0, 10))}<br>last seen ${esc(String(p.seen || '').slice(0, 10))}<br>terms ${esc(p.terms ? p.terms.version : 'not yet')}<br>${p.progress && p.progress.stamp ? `synced ${esc(ago(p.progress.at))}${p.progress.role ? ' &middot; ' + esc(p.progress.role) : ''}` : 'no saved game yet'}</td>
+<td class="small">${storeCell(p, esc)}<br>${p.device && p.device.name ? `last device: ${esc(p.device.name)} &middot; ${esc(ago(p.device.at))}` : 'last device: not known yet'}</td>
 <td><form method="post" action="/admin/players" onsubmit="return confirm('Give ${k} a new password? (Tell them by email.)')">${hidden}<input type="hidden" name="action" value="reset"><input type="hidden" name="who" value="${k}"><button type="submit">New password</button></form>
 <form method="post" action="/admin/players" onsubmit="return confirm('DELETE the account ${k}? This cannot be undone.')">${hidden}<input type="hidden" name="action" value="delete"><input type="hidden" name="who" value="${k}"><button type="submit" style="background:#ff8a80">Delete</button></form></td></tr>`;
     }).join('');
@@ -710,7 +973,7 @@ ${loadNote ? `<p class="small">${esc(loadNote)}</p>` : ''}
 <p class="small">${disk}<br>${gh}</p>
 ${safe ? '' : '<p class="off">Accounts are NOT safe from a redeploy yet. Turn on the disk or the GitHub backup (README.txt "LIVE ACCOUNTS"), and download a full backup now.</p>'}
 <p class="small">Passwords are stored scrambled (salted scrypt) - nobody can read them, including you. If a player forgets theirs, press "New password" and email them the new one; they can change it in the game (Settings &gt; Game &gt; Live account).</p>
-<form method="post" action="/admin/players">${hidden}<input name="q" value="${esc(q || '')}" placeholder="search username or email"> <button type="submit">Search</button></form>
+<form method="post" action="/admin/players">${hidden}<input name="q" value="${esc(q || '')}" placeholder="search username, email or store id"> <button type="submit">Search</button></form>
 <form method="post" action="/admin/players" style="display:inline">${hidden}<input type="hidden" name="action" value="csv"><button type="submit">Download usernames + emails (CSV)</button></form>
 <form method="post" action="/admin/players" style="display:inline">${hidden}<input type="hidden" name="action" value="backup"><button type="submit">Download full backup</button></form>
 <details><summary>Restore from a full backup</summary><form method="post" action="/admin/players" onsubmit="return confirm('Add the accounts from this backup? (Nothing here is removed.)')">${hidden}<input type="hidden" name="action" value="restore"><textarea name="data" rows="6" style="width:100%" placeholder="Paste the whole backup file here"></textarea><button type="submit">Restore (merge)</button></form></details>
@@ -737,9 +1000,12 @@ ${list.length > 500 ? `<p class="small">Showing the newest 500 of ${list.length}
     const stamp = new Date().toISOString().slice(0, 10);
 
     if (action === 'csv') {
-      const q = (s) => '"' + String(s || '').replace(/"/g, '""') + '"';
-      const lines = ['username,email,created,last_seen,terms_version,terms_agreed,last_sync,role'].concat(Object.values(state.players).map(p =>
-        [p.username, p.email, p.created, p.seen, p.terms && p.terms.version, p.terms && p.terms.at, p.progress && p.progress.stamp ? p.progress.at : '', p.progress ? p.progress.role : ''].map(q).join(',')));
+      // Round 109 (review L3): a cell a spreadsheet could read as a formula (= + - @, tab, CR) gets a ' in front.
+      const q = (s) => { let v = String(s || ''); if (/^[=+\-@\t\r]/.test(v)) v = "'" + v; return '"' + v.replace(/"/g, '""') + '"'; };
+      // Round 109: + the linked store account and the last device
+      const lines = ['username,email,created,last_seen,terms_version,terms_agreed,last_sync,role,store_account,last_device,last_device_at'].concat(Object.values(state.players).map(p =>
+        [p.username, p.email, p.created, p.seen, p.terms && p.terms.version, p.terms && p.terms.at, p.progress && p.progress.stamp ? p.progress.at : '', p.progress ? p.progress.role : '',
+          p.store ? p.store.id : '', p.device ? p.device.name : '', p.device ? p.device.at : ''].map(q).join(',')));
       res.writeHead(200, { 'content-type': 'text/csv; charset=utf-8', 'content-disposition': `attachment; filename="live-accounts-${stamp}.csv"`, 'cache-control': 'no-store' });
       res.end(lines.join('\n'));
       return;
@@ -776,6 +1042,20 @@ ${list.length > 500 ? `<p class="small">Showing the newest 500 of ${list.length}
 
     show(key, form.get('q') || '', note);
   });
+}
+
+/** Round 109: the admin row's store cell - the linked Moon Shards account (its balance), and any others seen with it. */
+function storeCell(p, esc) {
+  let line = 'store: none linked';
+  if (p.store && p.store.id) {
+    let sum = null;
+    try { sum = S().accountSummary(p.store.id); } catch { /* */ }
+    line = sum ? `store: <b>${esc(sum.id)}</b> &middot; ${esc(String(sum.shards))} shards &middot; ${esc(String(sum.owned))} items${sum.live && sum.live !== uidOf(p.username.toLowerCase(), p) ? ' <span class="off">(linked to another account there!)</span>' : ''}`
+      : `store: ${esc(p.store.id)} <span class="off">(not on this server)</span>`;
+  }
+  const others = Array.isArray(p.storeOthers) ? p.storeOthers.filter(o => o && o.id && (!p.store || o.id !== p.store.id)) : [];
+  if (others.length) line += `<br>also seen: ${others.map(o => esc(o.id)).join(', ')} (kept apart - never merged)`;
+  return line;
 }
 
 /** For the main /admin page: one line and the way in. */
@@ -857,7 +1137,7 @@ function privacyHtml() {
     if (m) main = m[1];
   } catch { /* */ }
   const live = `<h2>Live accounts (the Open Festival)</h2>
-  <p>To play live you make a live account: a <strong>username</strong> (shown to other players), your <strong>email address</strong> (never shown to other players; used to identify your account, to help you if you lose access, and for important notices about the Game or these policies) and a <strong>password</strong> (we only keep a scrambled one-way version - nobody, including us, can read it). We also keep when you made the account, when you last played, and that you agreed to the Terms of Service and confirmed you're 13 or older. Your device keeps a sign-in key so you don't have to type your password each time. We keep backups of accounts (encrypted where they're stored off our server) so an update never loses them. You can delete your account in the game (Settings &gt; Game &gt; Live account) or by emailing us; it's removed from our server straight away; older encrypted backup copies are kept only to protect everyone's accounts, are never used to bring a deleted account back, and are replaced over time.</p>
+  <p>To play live you make a live account: a <strong>username</strong> (shown to other players), your <strong>email address</strong> (never shown to other players; used to identify your account, to help you if you lose access, and for important notices about the Game or these policies) and a <strong>password</strong> (we only keep a scrambled one-way version - nobody, including us, can read it). We also keep when you made the account, when you last played, the kind of device you last played on (just the platform and the game's version, like "Android 1.4"), your character and what you've unlocked (so they follow you to any device), and that you agreed to the Terms of Service and confirmed you're 13 or older. Your device keeps a sign-in key so you don't have to type your password each time. We keep backups of accounts (encrypted where they're stored off our server) so an update never loses them. You can delete your account in the game (Settings &gt; Game &gt; Live account) or by emailing us; it's removed from our server straight away; older encrypted backup copies are kept only to protect everyone's accounts, are never used to bring a deleted account back, and are replaced over time.</p>
   <p>We never sell your information or use your email for advertising. We may email you about your account or important changes; we'll only send newsletters if you ask for them.</p>`;
   if (!main) {
     return `<h1>Privacy Policy</h1><p>${COMPANY}</p>${live}<h2>Contact</h2><p>${COMPANY} · ${esc0(CONTACT)}</p>`;
@@ -870,4 +1150,25 @@ function esc0(s) {
   return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
-module.exports = { handle, check, required, isReady, flush, final, adminSection, TERMS_VERSION, _test: { state: () => state, cleanUsername, validEmail, passwordProblem, seal, unseal, merge } };
+/**
+ * Round 109: the one HTTP gate for online writes (worlds.js, leaderboards.js): null = go on, else [status, reply].
+ * The game's sign-in comes as "Authorization: Bearer <token>" or "pt" in the JSON body. No sign-in at all (neither): a game
+ * from before Round 109 -> 426 "update". An unknown key -> 401 {signin:true}. LIVE_SIGNUP_REQUIRED=0: always go on.
+ * ok.account: the live account's key (lower-case username; '' when accounts are off).
+ */
+function gate(req, body, what) {
+  if (!required()) return { ok: true, account: '' };
+  if (!ready) return { ok: false, status: 503, reply: { ok: false, message: 'The server is just starting up - try again in a few seconds.' } };
+  const auth = String(req.headers.authorization || '');
+  const bearer = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
+  const hasPt = !!body && typeof body === 'object' && Object.prototype.hasOwnProperty.call(body, 'pt');
+  if (!bearer && !hasPt) {
+    if (graceActive()) return { ok: true, account: '', grace: true };   // Round 109 (review M5): an older game, in the grace period
+    return { ok: false, status: 426, reply: { ok: false, update: true, message: 'Update New Moon to play online - this version of the game is too old for live accounts.' } };
+  }
+  const p = check(bearer || String(body.pt || ''));
+  if (!p) return { ok: false, status: 401, reply: { ok: false, signin: true, required: true, message: `Sign in to your live account to ${what || 'play online'}.` } };
+  return { ok: true, account: p.uid, username: p.username.toLowerCase() };   // Round 109: the account's uid (worlds go by it)
+}
+
+module.exports = { handle, check, required, isReady, gate, redeemTicket, isTicket, graceActive, uidOf, flush, final, adminSection, TERMS_VERSION, _test: { state: () => state, cleanUsername, validEmail, passwordProblem, seal, unseal, merge, cleanSwag, unionSwag, pickProgress, cleanDevice, legacyUid } };

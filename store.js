@@ -55,8 +55,17 @@ const PACKS = [
   { id: 'crate', label: 'A crate of shards', shards: 5000, bonus: 1500, cents: 4999 }
 ];
 
+// Round 109: the career's bonus site "Neon Speedway" - EARNED in the career, or unlocked early with shards. Its price in ONE
+// place: 500 shards = the "handful" pack's $4.99 (packs are 100 shards a dollar before bonuses; SHARD_CENTS below says the
+// same). Change this number to change the price everywhere (the game reads it from /store/catalog).
+// The id must match Scripts/Net/PremiumItems.cs (SiteSpeedway).
+const SITE_SPEEDWAY_ID = 'site_speedway';
+const SITE_SPEEDWAY_SHARDS = 500;
+
 // The platform's own premium pieces. The ids must match Scripts/Social/OutfitLook.cs (Premium = true).
+// Round 109: + the Neon Speedway site (not a piece to wear - Scripts/Net/PremiumItems.cs).
 const PREMIUM = [
+  { id: SITE_SPEEDWAY_ID, name: 'Neon Speedway (bonus career site)', shards: SITE_SPEEDWAY_SHARDS },
   { id: 'moonjacket', name: 'Moonlight bomber', shards: 600 },
   { id: 'booth-dome', name: 'Geodesic dome booth', shards: 450 },     // Round 57: player booths
   { id: 'booth-moonkit', name: 'Moonlight booth colours', shards: 350 },
@@ -332,6 +341,161 @@ function authed(req) {
   if (!account) return null;
   const want = sha('tok|' + m[2]);
   return account.tokens.some(t => same(t.h, want)) ? account : null;
+}
+
+// ============================================================================ Round 109: one store account per LIVE account
+// (Round 109 review: keyed on the live account's immutable uid - the store field "liveUid" - never on its username)
+//
+// The owner: Moon Shards and premium items should follow the player's live account (players.js - username, email, password)
+// with nothing else to type. Each store account may carry "live": the live account (its lower-case username) it belongs to;
+// players.js keeps the other half (p.store). linkLive runs at every sign-in (and once per launch) with what this device has:
+//
+//   the live account has NO store account yet:
+//     - the device's store account belongs to nobody     -> it becomes this live account's (LINKED)
+//     - the device's store account belongs to SOMEONE ELSE (another live account signed in on this device before)
+//                                                         -> never handed over: "foreign" (the game puts it aside on the
+//                                                            device - its owner gets it back by signing in), and a new
+//                                                            empty one is made for this account if asked (create)
+//     - the device has none                               -> a new one is made (create), named after the username
+//   the live account HAS one:
+//     - the device has the same one                       -> nothing to do
+//     - the device has none (a new phone)                 -> a sign-in for it is handed to this device (token)
+//     - the device has a DIFFERENT one, belonging to nobody:
+//         * the account's own one is EMPTY (no shards, no items, no passes) -> the device's one takes its place (SWAPPED);
+//           the empty one is simply let go (nothing is lost)
+//         * otherwise BOTH STAY, nothing is merged: this device switches to the account's one (token) and the game keeps
+//           the device's one aside ("parked" - its balance shown, one tap to use it here again). Moving shards between
+//           two store accounts is for a human (the admin), never automatic: they could be two different people's.
+//     - the device has one belonging to someone else       -> "foreign" (put aside) + the account's one (token)
+// Nothing here touches a balance, an order or a purchase record: Stripe, Steam, Google Play and the App Store keep
+// checking purchases against the store account id exactly as before (iap tokens are made from that id).
+
+/** A store sign-in as the game keeps it ("<id>.<token>") -> that account, or null. */
+function accountFromAuth(text) {
+  const m = /^(A[A-Z2-9]{12})\.([a-f0-9]{64})$/.exec(String(text || '').trim());
+  if (!m) return null;
+  const account = own(state.accounts, m[1]);
+  if (!account) return null;
+  const want = sha('tok|' + m[2]);
+  return account.tokens.some(t => same(t.h, want)) ? account : null;
+}
+
+/**
+ * Holds anything worth keeping: shards, items, Big Night passes waiting or running - Round 109 (review M3): or a purchase
+ * still on its way (a Stripe checkout not settled yet, a Steam / phone purchase being checked), so it's never let go.
+ */
+function hasValue(a) {
+  if (!a) return false;
+  if ((a.shards || 0) > 0 || (a.owned || []).length > 0) return true;
+  const now = Date.now();
+  if (Array.isArray(a.passes) && a.passes.some(p => { const s = passState(p, now); return s === 'ready' || s === 'active'; })) return true;
+  return pendingFor(a.id) > 0;
+}
+
+/** Round 109: purchases for this account that haven't settled yet (open Stripe checkouts, IAP being checked). */
+function pendingFor(id) {
+  let n = 0;
+  for (const o of Object.values(state.orders || {})) if (o && o.account === id && o.status === 'open') n++;
+  for (const r of Object.values(state.iap || {})) if (r && r.account === id && (r.status === 'init' || r.status === 'waiting')) n++;
+  return n;
+}
+
+/** For the admin page (players.js) and the game's "put aside" note: no secrets. */
+function accountSummary(id) {
+  const a = own(state.accounts, String(id || ''));
+  return a ? { id: a.id, name: a.name, shards: a.shards || 0, owned: (a.owned || []).length, passes: readyPasses(a), pending: pendingFor(a.id), live: a.liveUid || '' } : null;
+}
+
+function liveLinkable() { return !broken && persistent(); }
+
+const UID_RE = /^u[0-9a-f]{24}$/;
+
+/**
+ * The store account that belongs to the live account with uid <liveUid> (see the rules above). Round 109 (review H1): keyed
+ * on the account's immutable uid (store field "liveUid"), never the username - a username signed up again after a delete
+ * is someone else and never finds the old store account. <hintId>: the id players.js has on record ('' = none).
+ * <deviceAuth>: this device's store sign-in ('' = none). opts: {create, adopt, name, email, ip}.
+ * Round 109 (review L1): a store account from before accounts that HOLDS something (shards, items, passes, a purchase on its
+ * way) is only ever added to a live account when the player said yes on that device (adopt) - else the answer is
+ * {ask: {id, shards, owned, pending}} and nothing changes. An empty one is simply linked (nothing to mix up).
+ * -> {ok, store (id or ''), token?, account?, parked?, foreign?, created?, swapped?, replaced?, linked?, ask?}
+ */
+function linkLive(liveUid, hintId, deviceAuth, opts) {
+  opts = opts || {};
+  liveUid = String(liveUid || '');
+  if (!UID_RE.test(liveUid)) return { ok: false, message: 'No live account.' };
+  if (!liveLinkable()) return { ok: true, store: '', off: true };   // (no store on this server: nothing to link)
+  const dev = accountFromAuth(deviceAuth);
+  // The account's own store account: the one on record if it's still theirs, else any that says it's theirs.
+  let mine = hintId ? own(state.accounts, String(hintId)) : null;
+  if (mine && mine.liveUid !== liveUid) mine = null;   // (on record, but not this person's there - someone else's, or let go: never re-taken)
+  if (!mine) mine = Object.values(state.accounts).find(a => a && a.liveUid === liveUid) || null;
+  const out = { ok: true, store: '' };
+  const handTo = (a) => { out.token = transact(() => newToken(a)); out.account = publicAccount(a); };
+  const ask = (a) => ({ id: a.id, shards: a.shards || 0, owned: (a.owned || []).length, pending: pendingFor(a.id) });
+
+  if (!mine) {
+    if (dev && !dev.liveUid) {
+      if (hasValue(dev) && !opts.adopt) { out.ask = ask(dev); return out; }   // the player says yes (or "not mine") first
+      transact(credit => { dev.liveUid = liveUid; credit({ type: 'live-link', account: dev.id, live: liveUid }); });
+      out.store = dev.id;
+      out.linked = true;
+      return out;
+    }
+    if (dev) out.foreign = true;   // (someone else's: the game puts it aside on this device)
+    if (opts.create && isOpen() && Object.keys(state.accounts).length < MAX_ACCOUNTS) {
+      // Round 109 (review L5): the same limit as making one in the Store (/store/account/create).
+      if (limited('create|' + String(opts.ip || ''), 5, 3600000)) return Object.assign(out, { ok: false, status: 429, message: 'Too many new accounts from here - try again later.' });
+      const name = cleanName(opts.name, 20);
+      const email = String(opts.email || '').trim().toLowerCase().slice(0, 120);
+      const made = transact(credit => {
+        let id;
+        do { id = 'A' + randomCode(12); } while (state.accounts[id]);
+        const account = { id, name: name.length >= 2 ? name : 'Player', email, created: new Date().toISOString(), shards: 0, owned: [], tokens: [], recoveryHash: '', liveUid };
+        state.accounts[id] = account;
+        const token = newToken(account);
+        credit({ type: 'account', account: id, live: liveUid });
+        return { account, token };
+      });
+      out.store = made.account.id;
+      out.token = made.token;
+      out.account = publicAccount(made.account);
+      out.created = true;
+    }
+    return out;
+  }
+
+  out.store = mine.id;
+  if (dev && (dev.id === mine.id || dev.liveUid === liveUid)) { out.store = dev.id; return out; }   // all set (the device's is theirs too)
+  if (!dev) { handTo(mine); return out; }      // a new device: its sign-in for the account's store account
+  if (!dev.liveUid) {
+    if (hasValue(dev) && !hasValue(mine)) {
+      // The account's one holds nothing, the device's does: with a yes on this device, the device's takes its place.
+      if (!opts.adopt) { out.ask = ask(dev); return out; }
+      transact(credit => {
+        mine.liveUid = '';
+        dev.liveUid = liveUid;
+        credit({ type: 'live-link', account: dev.id, live: liveUid, replaced: mine.id });
+      });
+      out.store = dev.id;
+      out.swapped = true;
+      out.replaced = mine.id;   // (players.js keeps it with the account's "other store accounts" - never lost)
+      return out;
+    }
+    if (hasValue(dev)) out.parked = { id: dev.id, shards: dev.shards || 0, owned: (dev.owned || []).length, pending: pendingFor(dev.id) };   // both stay - never merged
+  } else {
+    out.foreign = true;
+  }
+  handTo(mine);
+  return out;
+}
+
+/** The live account (uid) is gone (deleted): its store account stays (it holds purchases) and is never re-linked by a hint. */
+function unlinkLive(liveUid, id) {
+  const a = own(state.accounts, String(id || ''));
+  if (!a || a.liveUid !== String(liveUid || '') || !liveLinkable()) return false;
+  transact(() => { a.liveUid = ''; });
+  return true;
 }
 
 // ============================================================================ the catalog
@@ -1062,6 +1226,12 @@ function accountToken(accountId) {
 function wrongAccount(res, tokenFromStore, accountId) {
   const t = String(tokenFromStore || '').toLowerCase();
   if (!t || t === accountToken(accountId)) return false;
+  // Round 109 (review M3): + the token it was made for (not an account id), so the game can find that store account among
+  // the ones it keeps aside on this device and offer to switch to it.
+  if (/^[0-9a-f-]{36}$/.test(t)) {
+    json(res, 202, { ok: false, retry: true, otherToken: t, message: 'This purchase was made while signed in to a different Moon Shards account on this device. Switch to that account to receive it.' });
+    return true;
+  }
   iapRetry(res, 'This purchase was made while signed in to a different account on this device. Sign in to that account to receive it.');
   return true;
 }
@@ -2262,6 +2432,7 @@ function stats() {
 
 module.exports = {
   handle, adminSection, adminAction, mergeIntoFeed, backup, catalog, CURRENCY,
+  linkLive, unlinkLive, accountSummary,   // Round 109: the live account's store account (players.js)
   stats,   // Round 71: for the play-stats dashboard
   // Round 58: Big Night rooms (relay.js)
   bigNightStart, bigNightUntil, bigNightConfig, setRoomSizes, setBigNightRooms,

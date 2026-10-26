@@ -423,7 +423,7 @@ function handle(req, res) {
   if (!ROUTES.includes(route)) return false;
 
   if (req.method === 'OPTIONS') {
-    res.writeHead(204, { 'access-control-allow-origin': '*', 'access-control-allow-methods': 'GET, POST', 'access-control-allow-headers': 'content-type' });
+    res.writeHead(204, { 'access-control-allow-origin': '*', 'access-control-allow-methods': 'GET, POST', 'access-control-allow-headers': 'content-type, authorization' });   // Round 109: + the sign-in
     res.end();
     return true;
   }
@@ -432,6 +432,9 @@ function handle(req, res) {
   if (route === '/scores' || route === '/boards/join') {
     if (req.method !== 'POST') { reply(res, 405, { ok: false, message: 'Scores are sent from the game.' }); return true; }
     readBody(req, res, (parsed) => {
+      // Round 109: putting scores on the world boards needs the live account (like everything online); looking stays open.
+      const gate = require('./players').gate(req, parsed, 'put your scores on the world boards');
+      if (!gate.ok) { reply(res, gate.status, gate.reply); return; }
       const [status, obj] = route === '/scores' ? submitScore(parsed, ip) : join(ip);
       reply(res, status, obj);
     });

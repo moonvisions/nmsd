@@ -867,15 +867,82 @@ SAVED GAMES FOLLOW THE ACCOUNT (Round 75 - progress sync)
  For the curious (the game does this by itself, with the player's sign-in token):
    GET  /players/progress   -> {ok:true, stamp, social, progress, role}   (stamp 0 and "" until the first sync)
    POST /players/progress   {stamp, social, progress, role} -> {ok:true, stamp}
-        - at most 96 KB; one write every 15 seconds per account ("slow down"); if the server already has a
+        - at most 128 KB (Round 109; was 96); one write every 15 seconds per account ("slow down"); if the server already has a
           NEWER copy it answers {ok:false, stale:true, ...the newer copy} and the game picks.
+
+ROUND 109 - DO THESE IN THIS ORDER (or older copies of the game can't host or join rooms)
+ 1. Publish game build 109 everywhere players get the game: the GitHub release (the in-game updater reads it), and
+    Google Play / Steam too once the game is on them.
+ 2. Wait until most players have updated (a few days - check /admin/stats for the version players are on).
+ 3. Only THEN upload the new server files to GitHub (players.js, store.js, relay.js, worlds.js, leaderboards.js,
+    README.txt, .gitignore). Render redeploys by itself.
+ SAFETY NET - the grace switch: if you want to put the server up before everyone has updated, set
+    LIVE_ACCOUNT_GRACE_UNTIL = 2026-11-15T00:00:00Z   (any date and time, in that exact form)
+ in Render > nmsd > Environment > Add > Save. Until that moment, older copies of the game (without accounts) can
+ still host and join rooms with codes, use saved worlds they made on that device, and send world-board scores.
+ After it, they're told to update. https://nmsd.onrender.com/players/status shows "grace":true while it's on.
+ (The Open Festival needed an account already - the grace switch doesn't change it.) Delete the setting when the
+ date has passed.
+
+EVERY ONLINE THING NEEDS THE ACCOUNT NOW (Round 109)
+ - Before: only the Open Festival asked for a live account. Now EVERYTHING online does: the Open Festival,
+   hosting or joining a room with a code, Big Night rooms, live events (hosting and joining), and saved worlds
+   (opening, visiting, and the worlds list). The offline career and the demo still need no account.
+ - In the game it's one short flow wherever the player starts: sign up / sign in -> (the first time) make your
+   festival-goer -> straight into what they asked for.
+ - At launch the game quietly checks the sign-in: the title shows "Signed in as <username>". If the sign-in
+   stopped working (password changed elsewhere), the game asks "Sign in again" the next time they go online -
+   never a pop-up at launch. Offline: nothing changes.
+ - OLDER COPIES of the game (before Round 109) are told "Update New Moon to play online" when they try to host or
+   join a room or use saved worlds (they have the in-game updater). The Open Festival answers them as before.
+ - The character follows the account: name, body, face, hair, the outfit being worn, saved looks, the swag
+   unlocked and its progress ride in the saved game (the "identity" and "swag" fields, inside players.json and
+   the GitHub backup like everything else - nothing to set up). Swag is kept as a UNION: once any device unlocks
+   a piece, the account keeps it.
+ - SAVED WORLDS FOLLOW THE ACCOUNT: a world now belongs to the live account. Worlds made before this update are
+   linked to the account the first time their owner opens the worlds list while signed in. After that, any device
+   signed in to that account sees and hosts them; a world linked to one account is never given to another (even on
+   the same device). With LIVE_SIGNUP_REQUIRED=0 the old per-device world key works on its own again.
+ - WORLD LEADERBOARDS: sending scores needs the live account (scores wait in the game until the player signs in);
+   looking at the boards stays open to everyone.
+ - MOON SHARDS FOLLOW THE ACCOUNT: at every sign-in the game links the device's Moon Shards store account to the
+   live account (one store account per live account). Rules: a store account that belongs to nobody gets linked;
+   a new device gets the account's own one automatically; a store account that already belongs to someone else is
+   NEVER handed over; and two store accounts are NEVER merged automatically (they could be two people's). If one
+   person really has two (bought on two devices before this update), the game keeps both and tells them to email
+   you - on /store admin use "grant" to move the shards by hand (the /admin/players row shows both ids).
+ - /admin/players now shows, for each account: the linked store account (id, shards, items), any other store
+   account seen with it (kept apart), and the LAST DEVICE (e.g. "Android 1.4.0.109 - 2 h ago" - the platform and
+   game version only). The CSV has store_account, last_device and last_device_at columns. You can search by a
+   store account id too.
+ - PRIVACY + SAFETY (Round 109 review): each account has a permanent hidden id. If someone deletes their account
+   and a different person later signs up with the same username, the new person gets NOTHING of the old one (no
+   Moon Shards, character, swag or worlds), even after a backup restore. Deleting an account (in the game or with
+   your "Delete" button) also deletes that player's saved worlds straight away. On a shared device the game asks
+   before adding Moon Shards or worlds from before accounts to whoever signs in ("Add them to <name>?" / "Not mine").
+   The game connects to rooms with a one-minute, one-use ticket instead of putting its sign-in key in the address.
+ - New for the curious:  GET /players/status -> {ok, ready, required, grace, graceUntil}  ·  POST /players/ticket
+   ·  POST /worlds/claim  ·  POST /players/store-link (the game's)
+   ·  /players/me?device=...  ·  POST /players/progress takes "identity" (max 16 KB) and "swag" (a list); the body
+   limit is 128 KB. Rooms: /host and /join need ?pt=<the game's sign-in key>; /worlds/* need the same key
+   (Authorization: Bearer). The 15-second sync limit and every other rate limit are unchanged.
+
+NEON SPEEDWAY - the career's bonus site, unlocked early with Moon Shards (Round 109)
+ - Store id "site_speedway". Price: 500 shards (= the $4.99 "handful" pack). To change it, edit ONE number in
+   store.js: SITE_SPEEDWAY_SHARDS. It's bought with shards like the premium outfits (no new payment path), and it
+   belongs to the player's store account - which now follows their live account.
 
 SETTINGS (Render > nmsd > Environment)
  - ADMIN_KEY             your admin password (already set - only ever here, never in a GitHub file).
  - STORE_DATA_DIR        the disk (A above).
  - BACKUP_GITHUB_REPO / BACKUP_GITHUB_TOKEN / BACKUP_KEY    the GitHub backup (B above).
  - CONTACT_EMAIL         the help email on the Terms / Privacy pages (default daniel@moonvisionmedia.com).
- - LIVE_SIGNUP_REQUIRED  "0" turns accounts off (anyone can join live without one). Default: required.
+ - LIVE_ACCOUNT_GRACE_UNTIL  optional, an ISO date like 2026-11-15T00:00:00Z: until then, older games without
+                         accounts may still use rooms, saved worlds and the world boards (see "ROUND 109 - DO THESE IN
+                         THIS ORDER" above). Not set = no grace.
+ - LIVE_SIGNUP_REQUIRED  "0" turns accounts off for EVERYTHING online (the Open Festival, rooms, live events,
+                         saved worlds - anyone can play online without one). Default: required. Round 109: this is
+                         the emergency switch if accounts ever have a problem - set it, Save, and it redeploys.
 
 GOOD TO KNOW
  - Game updates never touch accounts: they live on this server. The device only keeps a sign-in key
@@ -944,3 +1011,29 @@ FOR THE CURIOUS (what the game sends; the seller is signed in with their live ac
  Links must be https:// and public addresses; pictures must end in .jpg or .png (the game cannot show .webp - the
  game can't draw WebP and shows a picture glyph instead). Up to 8 products / 8 pictures a shop.
  File on the disk: sellers.json (and sellers.json.bak, the version before).
+
+
+LIVE MODE - ROUND 97 (nothing to set up: just upload the new relay.js)
+Only relay.js changed. On GitHub open relay.js, Edit (pencil), select all, paste the new one, Commit changes.
+Render restarts the server by itself in a minute or two (everyone in the Open Festival is told and gets back in).
+What's new:
+ - Players can high-five, hug, dance together, trade kandi, invite each other to games, take group photos and follow
+   each other. The server passes each of these only to the player it's for, and stops spam (one offer at a time, a few
+   per person). A player can BLOCK someone: nothing of theirs reaches them any more, voice included.
+ - Shared moments at the Open Festival every few minutes, the same for everyone there: a crowd challenge ("get 5
+   people dancing at the main stage"), THE DROP, fireworks, and a crew call for medics / security / stage crew.
+ - Tonight's live leaderboard (points for things two players both said yes to, and for the moments). It starts again
+   each festival day.
+ - A dropped phone signal keeps your place for 20 seconds: come back in that time and nobody sees you leave.
+ - Less traffic: far-away players' steps are sent less often, and newer games get their messages in small batches.
+   Older games (Build 98) still work exactly as before.
+ - https://nmsd.onrender.com/metrics shows how the server is doing (players, memory, the last minute's traffic) -
+   no names or addresses on it.
+ - An online room whose host's game froze, with nobody in it, closes itself after 15 minutes.
+Optional settings (Render > Environment; leave them out for the normal values):
+   LIVE_GAP_MS        milliseconds between shared moments (360000 = 6 minutes)
+   LIVE_FIRST_MS      the first moment after someone arrives (90000)
+   LIVE_LEAD_IN_MS    the countdown before a moment (40000)
+   LIVE_KINDS         which moments and in what order, e.g. crowd,drop,crew,fireworks
+   RESUME_GRACE_MS    how long a dropped player's place is kept (20000)
+   RELAY_DEFLATE      1 = compress big messages for web-browser players (uses more memory; off by default)

@@ -81,6 +81,31 @@
 // clock and roles; GET /schedule?target=event:public = the DJ set times from the patch bay (edit them on /admin/patch,
 // target "The public festival"); GET /healthz = "ok" (for a free uptime pinger).
 // Settings: PUBLIC_CAPACITY (60), PUBLIC_DAY_SECONDS (7200 = one festival day every two hours).
+//
+// Round 97: live mode, front to back (see the "Round 97" section below for the details).
+//  - A game says what it can do: /public?...&cap=<bits> (1 = it reads several lines in one frame: "~b", then the lines, '\n' between them;
+//    2 = live interactions and shared moments; 4 = keep my place a moment if my connection drops). "pub" answers with
+//    "cap":<what this relay does> and "resumed":1 when you got your old place back. Games that don't say get exactly what
+//    they always got.
+//  - Lighter traffic: steps are rounded (centimetres, tenths of a degree), far players' steps are thinned (near 45 m:
+//    every step, up to 110 m: about 3 a second, beyond: every 2 s) once more than 6 are in, and games that can read them
+//    get their lines in small batches (every 40 ms) - far fewer frames for the free server to send.
+//  - Interactions between real players on the custom channel "lx" ("<op>|<kind>|<nonce>[|<arg>]", "target" = who it's
+//    for): high fives, hugs, dancing together, kandi trades, game invites, group photos, follows. The relay delivers each
+//    to its one target only, holds every player to offer limits (no invite / high-five spam), drops lines to anyone who
+//    blocked the sender ({"relay":"block","g":id,"on":true}) and keeps their voice from them too.
+//  - Shared festival moments everyone in the Open Festival sees together, run by this server's clock: a crowd challenge
+//    ("get N people dancing at the main stage", a shared progress bar, a reward for everyone who joined in), THE DROP, a
+//    fireworks moment, and a crew call for the staff roles (medics / security / stage crew, together). Games check in
+//    with {"relay":"lv","id":<moment>}; the relay counts and tells everyone {"relay":"live","k":"next|go|prog|done",...}.
+//  - Tonight's live leaderboard: points for interactions that both sides confirmed and for taking part in moments, kept
+//    for the festival day ({"relay":"live","k":"board","top":[...],"me":n,"rank":n} every 15 s when it changes).
+//  - Smooth reconnects: a game with cap 4 whose connection drops (no goodbye) keeps its number, name and figure for 20 s
+//    (RESUME_GRACE_MS); coming back in that time (or while its old connection has gone silent) it simply carries on.
+//    Leaving on purpose says {"relay":"bye"} first, so nobody waits for a ghost.
+//  - GET /metrics: uptime, memory, rooms, players and the last minute's traffic (no names, no addresses).
+//  - Hosts that have gone silent for IDLE_HOST_MS (15 min) with nobody in their room are closed (a frozen game kept rooms open).
+//  - RELAY_DEFLATE=1 switches on WebSocket compression for big messages (web browsers use it; off by default - it costs memory).
 'use strict';
 const http = require('http');
 const { WebSocketServer } = require('ws');
@@ -198,6 +223,48 @@ const hostTries = new Map();       // ip -> failed event-password tries (a brake
 let hostTriesAll = [];
 const ticketSockets = new Map();   // event|ticket -> how many are in with it right now       // a live event's room (every player goes through the organiser's game)
 
+// Round 109: EVERY ONLINE ROOM NEEDS A LIVE ACCOUNT (the owner: "In order to play online, you must make a username + password
+// + email"). The Open Festival already did (publicConnect); now hosting a room (/host - a room, a saved world, a Big Night,
+// a live event) and every way of joining one (/join?code=, /join?event=, and so a saved world's room) check the same
+// sign-in key, the same way: ?pt=<the game's live sign-in token>. A game from before Round 109 never sends pt at all - it's
+// told to update (it has the in-game updater, so one tap). A game that sends a key the server doesn't know (the password
+// was changed, or it signed out elsewhere) gets "signup: ..." and asks the player to sign in again. A reconnect after a
+// dropped connection goes through here again with the same key, so a signed-in player is never thrown out mid-session.
+// LIVE_SIGNUP_REQUIRED=0 (players.required()) switches all of it off. Rate limits and every other check are unchanged.
+const UPDATE_TO_PLAY = 'Update New Moon to play online - this version of the game is too old for live accounts.';
+
+// Round 109 (security review):
+//  - L4: the game sends a single-use TICKET (players.js /players/ticket, good for 60 s) as pt - not its long-lived sign-in key,
+//    which would sit in proxy and server logs with the address. The long-lived key is only taken during the grace period.
+//  - M5: LIVE_ACCOUNT_GRACE_UNTIL=<ISO date> - until then, a game too old for accounts (no pt at all) may still host and
+//    join rooms, so the server can be deployed before every player has updated (/public is unchanged: it already needed one).
+/** -> { ok, account (the live account's uid; '' when accounts are off or an old game in the grace period), text (why not) } */
+function liveAccountFor(url) {
+  if (!players.required()) return { ok: true, account: '' };
+  if (!players.isReady()) return { ok: false, text: 'The server is just starting up - try again in a few seconds.' };
+  if (!url.searchParams.has('pt')) return players.graceActive() ? { ok: true, account: '', grace: true } : { ok: false, text: UPDATE_TO_PLAY };
+  const pt = url.searchParams.get('pt') || '';
+  // Round 109 (final check): a ticket that's no good (used, out of date, from a server with another key) is NOT a reason to
+  // sign anyone out - it's refused as "ticket: ...", and the game fetches a fresh one and tries again. Only a missing or
+  // unknown sign-in is "signup: ...".
+  if (players.isTicket(pt)) {
+    const t = players.redeemTicket(pt);
+    return t ? { ok: true, account: t.uid || '' } : { ok: false, text: TICKET_AGAIN };
+  }
+  const p = pt ? players.check(pt) : null;
+  if (!p) return { ok: false, text: 'signup: Please sign in to your live account to play online.' };
+  if (!players.graceActive()) return { ok: false, text: TICKET_AGAIN };   // a good sign-in key, but rooms take a ticket
+  return { ok: true, account: p.uid || '' };
+}
+
+const TICKET_AGAIN = 'ticket: That connection ticket ran out - getting a fresh one.';
+
+/** Turns a connection away for want of a live account: the words as a goodbye (games read them), then its own close code. */
+function refuseForAccount(ws, text) {
+  send(ws, JSON.stringify({ t: 'bye', from: 0, text }));
+  ws.close(4003, text.slice(0, 120));
+}
+
 /** Round 50: the organiser's password for opening an event (EVENT_HOST_KEY - its own, never the admin one). */
 function eventKeyOk(key) {
   const want = process.env.EVENT_HOST_KEY || '';
@@ -256,7 +323,10 @@ function guestAllowed(ws, bytes) {
 function sendToHost(room, text) {
   const host = room.host;
   if (!host || host.readyState !== 1 || host.bufferedAmount > MAX_BUFFERED) return;
+  if (host.cap & CAP_BATCH) { queueLine(host, text); return; }   // Round 97: the public festival's lead reads batches
+  if (host.outbox && host.outbox.length) flushOut(host);
   host.send(text);
+  metrics.linesOut++; metrics.framesOut++; metrics.bytesOut += text.length;
 }
 
 /** Round 57: one player reports another in their room (from = the reporter's id, 0 = the host). */
@@ -595,7 +665,13 @@ function relayVoice(room, from, sender, data) {
   const audio = text.slice(colon + 1);
   if (!audio || !/^[A-Za-z0-9+/=]+$/.test(audio)) return;
   const line = 'v:' + from + ':' + audio;
-  const deliver = (ws) => { if (ws && ws !== sender && ws.readyState === 1 && ws.bufferedAmount < VOICE_BACKLOG && voiceNear(room, sender, ws)) ws.send(line); };   // Round 93: + near the talker (public festival)
+  const senderKey = room.isPublic ? blockKey(sender) : '';   // Round 97: nobody hears someone they blocked
+  const deliver = (ws) => {
+    if (!ws || ws === sender || ws.readyState !== 1 || ws.bufferedAmount >= VOICE_BACKLOG || !voiceNear(room, sender, ws)) return;   // Round 93: + near the talker (public festival)
+    if (senderKey && ws.blocks && ws.blocks.has(senderKey)) return;
+    ws.send(line);
+    metrics.voice++;
+  };
   if (to === '') {
     if (from !== 0) deliver(room.host);
     for (const guest of room.guests.values()) deliver(guest);
@@ -698,6 +774,38 @@ const PUBLIC_LEAD_BLOCKED = new Set(['bye', 'leave', 'welcome', 'start', 'snapsh
 const publicBans = new Map();           // ip -> until
 let publicSerial = 0;                   // a number per connection, for reports (a player's id changes if they become the lead)
 
+// Round 97 (see the notes at the top and the "Round 97" section below).
+const CAP_BATCH = 1, CAP_LIVE = 2, CAP_RESUME = 4, RELAY_CAPS = 7;
+const BATCH_MS = Math.max(5, Math.min(200, Number(process.env.RELAY_BATCH_MS) || 40));   // a batched line waits at most this long
+const BATCH_MAX = 48 * 1024;            // characters in one batch (it goes at once past this)
+const TIER_ABOVE = 6;                   // players in the room above which far players' steps are thinned
+const MID_RANGE = 110, MID_MS = 350;    // metres: players this close get a step about 3 times a second (nearer: every one)
+const RESUME_GRACE_MS = Math.max(0, Math.min(120000, Number(process.env.RESUME_GRACE_MS) || 20000));
+const RESUME_SILENT_MS = 8000;          // an old connection this quiet (a live game sends 2+ steps a second) is a dead one
+const LX_CHANNEL = 'lx';
+const LX_RE = /^([oynxgjlp])\|([a-z]{2,3})\|(\d{1,9})(?:\|[^\n|]{0,60}){0,3}$/;   // op | kind | nonce [| up to 3 small args]
+const LX_KINDS = new Set(['hf', 'hug', 'dn', 'kd', 'gm', 'ph', 'fl', 'wv']);
+const LX_RANGE = { hf: 12, hug: 10, dn: 25, kd: 12, gm: 250, ph: 25, fl: 60, wv: 40 };   // metres an offer may reach
+const LX_GROUP_RANGE = 40;              // a group line (a dance circle, a photo) reaches players this close
+const LX_RATE = 6, LX_BURST = 12;       // interaction lines a second per player
+const LX_OFFER_GAP = 900;               // ms between two offers from one player
+const LX_PAIR_WINDOW = 30000, LX_PAIR_MAX = 4;   // offers to the same player in 30 s
+const LX_POINTS = { hf: 2, hug: 2, wv: 1, dn: 3, kd: 3, gm: 3, ph: 3, fl: 0 };
+const LX_PAIR_COOLDOWN = 4 * 60000;     // the same two players earn points for the same thing this often
+const MAX_BLOCKS = 100;
+const LIVE_FIRST_MS = Math.max(5000, Number(process.env.LIVE_FIRST_MS) || 90000);     // the first moment after someone arrives
+const LIVE_GAP_MS = Math.max(10000, Number(process.env.LIVE_GAP_MS) || 6 * 60000);    // between moments
+const LIVE_LEAD_IN_MS = Math.max(3000, Number(process.env.LIVE_LEAD_IN_MS) || 40000); // "in 40 s at the main stage"
+const LIVE_CHECKIN_MS = 4500;           // a check-in counts for this long (games send one a second while they're in)
+const LV_RATE = 3, LV_BURST = 6;
+const BOARD_EVERY = Math.max(1000, Number(process.env.LIVE_BOARD_MS) || 15000), BOARD_TOP = 5, BOARD_MAX = 500;
+const IDLE_HOST_MS = Math.max(5000, Number(process.env.IDLE_HOST_MS) || 15 * 60000);
+// Round 97 (review): a batched frame starts with this line, so a game splits a frame only when the relay's batcher made it.
+const BATCH_MARK = '~b';
+const MIC_LINE_RE = /^m:\d{1,6}:[A-Za-z0-9+/=]{8,1700}$/;   // an open-mic line as the lead / host passes it on
+const LX_GROUP_GAP = { p: 10000, j: 3000, l: 1000 };          // ms between group lines of one kind from one player
+function hasLineBreak(text) { return text.indexOf('\n') >= 0 || text.indexOf('\r') >= 0; }
+
 const publicRoom = {
   host: null, guests: new Map(), nextId: 1, event: '', meta: null, metaAt: 0, metaSentAt: 0, ip: '(public)', banned: new Set(),
   noList: true, big: null, bigAskedAt: 0, mic: new Set(), world: '', peopleAt: 0, isPublic: true
@@ -794,8 +902,13 @@ function publicPresence(room, ws, id, text) {
   const role = publicRole(p.role);
   if (role) ws.role = role; else p.role = ws.role || 'goer';
   if (typeof p.gear === 'string' && p.gear.length > 4000) p.gear = '';
+  if (p.lvl !== undefined && (!Number.isInteger(p.lvl) || p.lvl < 0 || p.lvl > 9999)) delete p.lvl;   // Round 97: their level (newer games)
   ws.px = Number(p.x) || 0;
   ws.pz = Number(p.z) || 0;
+  if (Number.isInteger(p.lvl)) ws.lvl = p.lvl;
+  // Round 97: to the centimetre and a tenth of a degree - nobody can see more, and every step is shorter.
+  for (const k of ['x', 'y', 'z', 'speed']) if (typeof p[k] === 'number') p[k] = Math.round(p[k] * 100) / 100;
+  if (typeof p.yaw === 'number') p.yaw = Math.round(p.yaw * 10) / 10;
   // Round 93: a game writes every field of its message, most of them empty in a step ("save":"","relay":"",...). Those go:
   // a game reading the step gets the same (an empty field reads as its default), and every step is a third smaller.
   for (const k of Object.keys(p)) {
@@ -805,17 +918,24 @@ function publicPresence(room, ws, id, text) {
   }
   const line = JSON.stringify(p);
   const now = Date.now();
-  const everyone = publicPlayers(room) <= PUBLIC_ROUTE_ABOVE || now - (ws.presFullAt || 0) >= PUBLIC_FAR_MS;
-  if (everyone) ws.presFullAt = now;
-  const r2 = PUBLIC_NEAR * PUBLIC_NEAR;
+  // Round 97: interest - once more than TIER_ABOVE are in, each listener gets this player's steps by how far apart they are:
+  // every step within PUBLIC_NEAR, about 3 a second within MID_RANGE, one every PUBLIC_FAR_MS beyond (or before we know
+  // where the listener is). Was: everything below 21 players, then near-or-every-2-s. (PUBLIC_ROUTE_ABOVE is kept for reference.)
+  const tiered = publicPlayers(room) > TIER_ABOVE;
+  if (tiered && !ws.stepSentAt) ws.stepSentAt = new WeakMap();   // listener -> when they last got one of my steps
+  const near2 = PUBLIC_NEAR * PUBLIC_NEAR, mid2 = MID_RANGE * MID_RANGE;
   publicEach(room, other => {
-    if (other === ws || other.readyState !== 1 || other.bufferedAmount > VOICE_BACKLOG) return;
-    if (!everyone) {
-      if (other.px === undefined) return;
-      const dx = other.px - ws.px, dz = other.pz - ws.pz;
-      if (dx * dx + dz * dz > r2) return;
+    if (other === ws || other.readyState !== 1 || other.pubGone || other.bufferedAmount > VOICE_BACKLOG) return;
+    if (tiered) {
+      let gap = PUBLIC_FAR_MS;
+      if (other.px !== undefined) {
+        const dx = other.px - ws.px, dz = other.pz - ws.pz, d2 = dx * dx + dz * dz;
+        gap = d2 <= near2 ? 0 : d2 <= mid2 ? MID_MS : PUBLIC_FAR_MS;
+      }
+      if (gap > 0 && now - (ws.stepSentAt.get(other) || 0) < gap) { metrics.stepsThinned++; return; }
+      ws.stepSentAt.set(other, now);
     }
-    other.send(line);
+    queueLine(other, line);
   });
 }
 
@@ -876,14 +996,17 @@ function publicFanOut(room, ws, id, text) {
     return;
   }
   if (!fanAllowed(ws, p.t === 'social')) return;
+  if (p.t === 'custom' && p.ch === LX_CHANNEL) { publicLx(room, ws, id, p, text); return; }   // Round 97: to its one target only
   sendToHost(room, JSON.stringify({ relay: 'msg', g: id, m: text }));
   p.from = id;
   p.name = ws.pname;
   const line = JSON.stringify(p);
+  const key = p.t === 'social' ? blockKey(ws) : '';   // Round 97: a blocked player's social moments don't reach you
   for (const [gid, guest] of room.guests) {
     if (gid === id || guest === ws || guest.readyState !== 1 || guest.pubGone) continue;
     if (guest.bufferedAmount > MAX_BUFFERED) continue;   // far behind: skipped (never queued without end)
-    guest.send(line);
+    if (key && guest.blocks && guest.blocks.has(key)) continue;
+    queueLine(guest, line);   // Round 97: batched for games that read batches
   }
 }
 
@@ -1017,6 +1140,7 @@ function publicLeadMessage(room, ws, data) {
   try { packet = JSON.parse(data.toString()); } catch { return; }
   if (!packet || typeof packet !== 'object' || Array.isArray(packet)) return;
   if (packet.relay === 'role') { const role = publicRole(packet.id); if (role) ws.role = role; return; }
+  if (typeof packet.relay === 'string') { publicControl(room, ws, packet); return; }   // Round 97: bye, block, lv, alive (for the relay only)
   if (typeof packet.kick === 'number') {
     // Only a newcomer, straight after arriving (the lead's game turns away a different version). Nobody is banned here:
     // the lead is just another player.
@@ -1038,6 +1162,10 @@ function publicLeadMessage(room, ws, data) {
   }
   if (typeof packet.m !== 'string') return;   // (listings, Big Night, world saves: not in the public festival)
   if (packet.m.startsWith('{"relay"')) return;
+  // Round 97 (review): one line is one line - a line break would let a lead slip a second, made-up line (a server notice,
+  // someone else's step) into a game that reads batches. And an open-mic line is exactly "m:<id>:<audio>", nothing else.
+  if (hasLineBreak(packet.m)) return;
+  if (packet.m.startsWith('m:') && !MIC_LINE_RE.test(packet.m)) return;
   const toAll = packet.to === -1 || packet.to === undefined;
   // Round 66 (review): only game messages and open-mic lines - and none that only a host may send (a lead that turned
   // out to be a modified game can't send everyone home, or anyone a festival). A goodbye may go to one newcomer only.
@@ -1050,6 +1178,11 @@ function publicLeadMessage(room, ws, data) {
     if (!p) return;
     // The relay already gave everyone a guest's custom/social line - a lead passing it on again is skipped.
     if (Number.isInteger(packet.except) && fanParsedKind(p)) return;
+    // Round 97: the lead's own interaction line goes to its one target (or the players near it), checked like anyone's.
+    if (kind === 'custom' && p.ch === LX_CHANNEL) {
+      if ((p.from === undefined || p.from === -1 || p.from === 0) && (p.text === undefined || (typeof p.text === 'string' && p.text.length <= FAN_CUSTOM_TEXT))) publicLx(room, ws, 0, p, packet.m);
+      return;
+    }
     // The lead speaks only for itself (0; -1 = not set), or passes a line on for the one guest it came from.
     const from = p.from === undefined ? -1 : p.from;
     if (from !== 0 && from !== -1 && !(Number.isInteger(packet.except) && from === packet.except && room.guests.has(from))) return;
@@ -1072,10 +1205,10 @@ function publicLeadMessage(room, ws, data) {
     for (const id of packet.to.slice(0, MAX_TO_LIST)) {
       if (!Number.isInteger(id) || seen.has(id)) continue;
       seen.add(id);
-      send(room.guests.get(id), packet.m);
+      queueLine(room.guests.get(id), packet.m);   // Round 97: batched
     }
   } else if (toAll) {
-    for (const [gid, guest] of room.guests) if (gid !== packet.except) send(guest, packet.m);
+    for (const [gid, guest] of room.guests) if (gid !== packet.except) queueLine(guest, packet.m);   // Round 97: batched
   } else {
     send(room.guests.get(packet.to), packet.m);
   }
@@ -1085,6 +1218,7 @@ function publicLeadMessage(room, ws, data) {
 function publicMessage(room, ws, data) {
   if (ws.pubGone) return;
   ws.lastMsgAt = Date.now();
+  metrics.msgsIn++;   // Round 97
   const isLead = room.host === ws;
   const id = isLead ? 0 : ws.pubId;
   if (!isLead && room.guests.get(id) !== ws) return;
@@ -1104,6 +1238,7 @@ function publicMessage(room, ws, data) {
     let packet;
     try { packet = JSON.parse(data.toString()); } catch { return; }
     if (packet && packet.relay === 'role') { const role = publicRole(packet.id); if (role) ws.role = role; }
+    else if (packet && typeof packet === 'object' && typeof packet.relay === 'string') publicControl(room, ws, packet);   // Round 97
     return;
   }
   if (head.startsWith('{"t":"presence"')) { publicPresence(room, ws, id, data.toString()); return; }
@@ -1119,7 +1254,10 @@ function publicConnect(ws, url, ip) {
   if ((publicBans.get(ip) || 0) > now) { refuse('You were removed from the public festival after reports from other players. Try again later.'); return; }
   // Round 74: live mode needs a sign-up (a username and email) - and everyone there sees that username.
   if (players.required() && !players.isReady()) { refuse('The server is just starting up - try again in a few seconds.'); return; }
-  const signedUp = players.check(url.searchParams.get('pt') || '');
+  // Round 109: a ticket (or, from older games, the sign-in key). A ticket that's no good: "ticket:" (the game simply tries again).
+  const ptText = url.searchParams.get('pt') || '';
+  const signedUp = players.isTicket(ptText) ? players.redeemTicket(ptText) : players.check(ptText);
+  if (players.required() && players.isTicket(ptText) && !signedUp) { refuse(TICKET_AGAIN); return; }
   if (!signedUp && players.required()) { refuse('signup: Make a live account (username, email and password) to join the Open Festival. (Update the game if it doesn\'t ask you.)'); return; }
   // Round 93: the game's protocol version (?v=; 0 = an older game that doesn't say). A different one than the lead's can't
   // play together - turned away here, before anyone sees them, saying which side needs updating.
@@ -1134,50 +1272,505 @@ function publicConnect(ws, url, ip) {
   // Round 93: the same live account coming back (a dropped connection, or another device): the old connection goes now,
   // so they keep their name and nobody sees a frozen ghost of them. (Before the name is picked, so it isn't "Jade 2".)
   const account = signedUp ? String(signedUp.username || '').toLowerCase() : '';
+  // Round 97: what this game can do (?cap=; 0 = an older game that doesn't say).
+  const capText = String(url.searchParams.get('cap') || '');
+  ws.cap = /^\d{1,3}$/.test(capText) ? (Number(capText) & RELAY_CAPS) : 0;
+  let resumeFrom = null;   // Round 97: their old place, kept for them (dropped without a goodbye, or gone silent)
   if (account) {
     // (Round 93 review: only if the festival can take them - the old connection isn't let go for nothing.)
     if (!publicHasFreeId(room)) { refuse('The public festival is busy - try again in a minute.'); return; }
     const old = [];
     publicEach(room, other => { if (other.pubAccount === account && !other.pubGone) old.push(other); });
     for (const other of old) {
+      // Round 97: a guest whose connection has dropped (held for them) or gone silent gets its own number, name and figure
+      // back - nobody sees them leave and come back. A live connection elsewhere (another device) is replaced as before.
+      const held = other !== room.host && other.pubId > 0 && room.guests.get(other.pubId) === other &&
+        (other.readyState !== 1 || now - (other.lastMsgAt || 0) >= RESUME_SILENT_MS);
+      if (held && !resumeFrom && (ws.cap & CAP_RESUME)) { resumeFrom = other; continue; }   // (review: only a game that says it can resume)
       send(other, JSON.stringify({ t: 'bye', from: 0, ch: 'relay', text: 'You joined the Open Festival from another device.' }));
       publicDrop(room, other);
       // Round 93 (review): its own close code - the game there (lead or not) takes it as final and doesn't reconnect.
       try { other.close(4001, 'replaced'); } catch { /* gone already */ }
     }
   }
-  // (Round 93: counted after a returning player's old connection has gone - it mustn't keep them out.)
-  if (publicPlayers(room) >= PUBLIC_CAPACITY) { refuse(`The public festival is full right now (${PUBLIC_CAPACITY} people) - try again in a few minutes.`); return; }
+  // (Round 93: counted after a returning player's old connection has gone - it mustn't keep them out. Round 97: nor their
+  // own kept place.)
+  if (!resumeFrom && publicPlayers(room) >= PUBLIC_CAPACITY) { refuse(`The public festival is full right now (${PUBLIC_CAPACITY} people) - try again in a few minutes.`); return; }
   // Round 66 (review): a few players per address at most - one or two computers can't fill the whole festival.
   let fromHere = 0;
-  publicEach(room, other => { if (other.ip === ip && !other.pubGone) fromHere++; });
+  publicEach(room, other => { if (other.ip === ip && !other.pubGone && other !== resumeFrom) fromHere++; });
   if (fromHere >= PUBLIC_PER_IP) { refuse(`Only ${PUBLIC_PER_IP} players from one network can be in the public festival at once.`); return; }
   ws.pubAccount = account;
   ws.pv = pv;
-  ws.pname = publicName(room, signedUp ? signedUp.username : url.searchParams.get('name'));
-  ws.role = 'goer';
   ws.joinedAt = now;
   ws.lastMsgAt = now;
-  ws.pubSerial = ++publicSerial;
-  const lead = !room.host;
+  let lead = false;
   let id = 0;
-  if (lead) {
-    room.host = ws;
-    ws.leadSince = now;
+  if (resumeFrom) {
+    id = publicResume(room, resumeFrom, ws);
   } else {
-    id = publicNewId(room);
-    if (!id) { refuse('The public festival is busy - try again in a minute.'); return; }
-    room.guests.set(id, ws);
+    ws.pname = publicName(room, signedUp ? signedUp.username : url.searchParams.get('name'));
+    ws.role = 'goer';
+    ws.pubSerial = ++publicSerial;
+    lead = !room.host;
+    if (lead) {
+      room.host = ws;
+      ws.leadSince = now;
+    } else {
+      id = publicNewId(room);
+      if (!id) { refuse('The public festival is busy - try again in a minute.'); return; }
+      room.guests.set(id, ws);
+    }
   }
   ws.pubId = id;
-  send(ws, JSON.stringify(Object.assign({ relay: 'pub', id, name: ws.pname, lead, players: publicPlayers(room), capacity: PUBLIC_CAPACITY }, publicClock(now), { fan: 1 })));   // Round 93: fan = the relay passes guests' custom/social lines on itself
-  if (lead) send(ws, JSON.stringify({ relay: 'lead', old: -1 }));
-  else send(room.host, JSON.stringify({ relay: 'join', g: id, name: ws.pname }));
+  // Round 93: fan = the relay passes guests' custom/social lines on itself. Round 97: + cap (what this relay does), resumed.
+  send(ws, JSON.stringify(Object.assign({ relay: 'pub', id, name: ws.pname, lead, players: publicPlayers(room), capacity: PUBLIC_CAPACITY }, publicClock(now), { fan: 1, cap: RELAY_CAPS, resumed: resumeFrom ? 1 : 0 })));
+  if (lead) {
+    send(ws, JSON.stringify({ relay: 'lead', old: -1 }));
+    // Round 97: places kept for players whose connection dropped (everyone else had gone too) - the new lead knows them.
+    for (const [gid, other] of room.guests) send(ws, JSON.stringify({ relay: 'join', g: gid, name: other.pname }));
+  } else if (!resumeFrom) send(room.host, JSON.stringify({ relay: 'join', g: id, name: ws.pname }));   // (a resumed player never left the lead's list)
+  if (!room.host) publicPromote(room, '');   // Round 97: came back to a festival whose lead had gone: someone leads at once
   sendPatches(ws, PUBLIC_CODE, room);   // the stages' live DJs straight away
   ws.on('message', (data) => publicMessage(room, ws, data));
-  ws.on('close', () => publicDrop(room, ws));
+  ws.on('close', (code) => publicClosed(room, ws, code));   // Round 97: a drop without a goodbye may keep their place a moment
+  if (ws.cap & CAP_LIVE) liveWelcome(room, ws);              // Round 97: the moment that's on (or next) and tonight's board
   publicCountAll(room);
 }
+
+// ---------------------------------------------------------------- Round 97: live mode - a lighter relay
+//
+// Batches: a game that reads them (cap 1) gets its lines joined with '\n' into one frame, at most BATCH_MS after the first
+// one waits (or at once past BATCH_MAX characters). A line sent straight away (send) first sends what was waiting, so the
+// order of lines never changes. Voice and the open mic never wait.
+
+const metrics = {
+  startedAt: Date.now(), msgsIn: 0, linesOut: 0, framesOut: 0, bytesOut: 0, batched: 0, stepsThinned: 0, voice: 0,
+  limited: 0, lxRouted: 0, lxBlocked: 0, resumes: 0, held: 0, moments: 0, idleClosed: 0
+};
+let metricsLast = null;                 // the last full minute's counts (GET /metrics)
+let metricsMark = Object.assign({}, metrics);
+const outPending = new Set();
+let outTimer = null;
+
+/** One line to one player: batched for a game that reads batches, else sent at once. */
+function queueLine(ws, line) {
+  if (!ws || ws.readyState !== 1) return;
+  if (!(ws.cap & CAP_BATCH)) { send(ws, line); return; }
+  if (ws.bufferedAmount > MAX_BUFFERED) { ws.terminate(); return; }   // (as send: far behind is let go, never queued without end)
+  if (!ws.outbox) { ws.outbox = []; ws.outBytes = 0; }
+  ws.outbox.push(line);
+  ws.outBytes += line.length;
+  metrics.linesOut++;
+  if (ws.outBytes >= BATCH_MAX) { flushOut(ws); return; }
+  outPending.add(ws);
+  if (!outTimer) outTimer = setTimeout(flushAllOut, BATCH_MS);
+}
+
+function flushOut(ws) {
+  outPending.delete(ws);
+  const box = ws.outbox;
+  if (!box || box.length === 0) return;
+  ws.outbox = [];
+  ws.outBytes = 0;
+  if (ws.readyState !== 1) return;
+  const text = box.length === 1 ? box[0] : BATCH_MARK + '\n' + box.join('\n');   // (review: marked, so only these are split)
+  metrics.batched += box.length - 1;
+  metrics.framesOut++;
+  metrics.bytesOut += text.length;
+  ws.send(text);
+}
+
+function flushAllOut() {
+  outTimer = null;
+  for (const ws of Array.from(outPending)) flushOut(ws);
+}
+
+// ---------------------------------------------------------------- Round 97: players' own lines to the relay
+
+/** Who a player is for blocks and the board: their live account (or, without one, their name). */
+function blockKey(ws) {
+  return ws && ws.pubAccount ? 'a:' + ws.pubAccount : 'n:' + String((ws && ws.pname) || '').toLowerCase();
+}
+
+/** A token bucket on the socket: rate a second, bursts up to burst. */
+function bucket(ws, field, rate, burst) {
+  const now = Date.now();
+  const at = field + 'At';
+  if (ws[field] === undefined) { ws[field] = burst; ws[at] = now; }
+  ws[field] = Math.min(burst, ws[field] + (now - ws[at]) * rate / 1000);
+  ws[at] = now;
+  if (ws[field] < 1) return false;
+  ws[field] -= 1;
+  return true;
+}
+
+/** {"relay":...} from a player (lead or guest) that's for the relay itself. */
+function publicControl(room, ws, packet) {
+  switch (packet.relay) {
+    case 'bye':
+      // Leaving on purpose: gone at once (no kept place, no waiting for the socket to close).
+      publicDrop(room, ws);
+      try { ws.close(1000, 'left'); } catch { /* gone already */ }
+      return;
+    case 'block':
+      publicBlock(room, ws, Number(packet.g), packet.on !== false);
+      return;
+    case 'lv':
+      if (bucket(ws, 'lvTokens', LV_RATE, LV_BURST)) liveCheckIn(room, ws, Number(packet.id));
+      else metrics.limited++;
+      return;
+    default:
+      return;   // "alive" (a phone going into the background) and anything newer: it already counted as hearing from them
+  }
+}
+
+/** A player blocks (or unblocks) another: nothing of theirs reaches them - interactions, social moments, voice. */
+function publicBlock(room, ws, g, on) {
+  if (!Number.isInteger(g) || g < 0) return;
+  const target = g === 0 ? room.host : room.guests.get(g);
+  if (!target || target === ws) return;
+  if (!ws.blocks) ws.blocks = new Set();
+  const key = blockKey(target);
+  if (!on) ws.blocks.delete(key);
+  else if (ws.blocks.size < MAX_BLOCKS) ws.blocks.add(key);
+}
+
+/** Are two players within this many metres (by their last steps)? Not known yet: yes. */
+function nearEachOther(a, b, metres) {
+  if (a.px === undefined || b.px === undefined) return true;
+  const dx = a.px - b.px, dz = a.pz - b.pz;
+  return dx * dx + dz * dz <= metres * metres;
+}
+
+/**
+ * An interaction line ("lx": "<op>|<kind>|<nonce>[|args]", target = who it's for). To its target only - never to anyone
+ * who blocked the sender - or, for a group line (join / leave a dance circle, a group photo: target -1), to the players
+ * near the sender. Offers are held to a gap, a range and a few per person; when an offer is answered yes, both players
+ * earn tonight's points (once per pair and kind every few minutes).
+ */
+function publicLx(room, ws, id, p, raw) {
+  const m = LX_RE.exec(typeof p.text === 'string' ? p.text : '');
+  if (!m || !LX_KINDS.has(m[2])) return;
+  if (!bucket(ws, 'lxTokens', LX_RATE, LX_BURST)) { metrics.limited++; return; }
+  const op = m[1], kind = m[2], nonce = m[3];
+  const now = Date.now();
+  const target = Number.isInteger(p.target) ? p.target : -1;
+  p.from = id;
+  p.name = ws.pname;
+  const line = JSON.stringify(p);
+  const myKey = blockKey(ws);
+  if (target < 0) {
+    if (op !== 'j' && op !== 'l' && op !== 'p') return;
+    // Round 97 (review): group lines have their own cooldown per player (a photo call every 10 s, a dance beacon every 3 s).
+    if (!ws.lxGroupAt) ws.lxGroupAt = {};
+    if (now - (ws.lxGroupAt[op] || 0) < LX_GROUP_GAP[op]) { metrics.limited++; return; }
+    ws.lxGroupAt[op] = now;
+    publicEach(room, other => {
+      if (other === ws || other.readyState !== 1 || other.pubGone || !nearEachOther(ws, other, LX_GROUP_RANGE)) return;
+      if (other.blocks && other.blocks.has(myKey)) return;
+      lxDeliver(room, other, id, raw, line);
+    });
+    return;
+  }
+  if (target === id) return;
+  const to = target === 0 ? room.host : room.guests.get(target);
+  if (!to || to === ws || to.readyState !== 1 || to.pubGone) return;
+  if (to.blocks && to.blocks.has(myKey)) { metrics.lxBlocked++; return; }   // silently: they never hear from you
+  if (op === 'o') {
+    if (now - (ws.lxOfferAt || 0) < LX_OFFER_GAP) { metrics.limited++; return; }
+    if (!nearEachOther(ws, to, (LX_RANGE[kind] || 15) + 6)) return;   // (+6: steps can be a moment old)
+    if (!ws.lxPer) ws.lxPer = new Map();
+    const per = (ws.lxPer.get(to.pubSerial) || []).filter(t => now - t < LX_PAIR_WINDOW);
+    if (per.length >= LX_PAIR_MAX) { metrics.limited++; return; }
+    per.push(now);
+    ws.lxPer.set(to.pubSerial, per);
+    if (ws.lxPer.size > 64) ws.lxPer.delete(ws.lxPer.keys().next().value);
+    ws.lxOfferAt = now;
+    if (!ws.lxOffers) ws.lxOffers = new Map();
+    ws.lxOffers.set(to.pubSerial + ':' + kind + ':' + nonce, now);
+    if (ws.lxOffers.size > 32) ws.lxOffers.delete(ws.lxOffers.keys().next().value);
+  } else if (op === 'y' && to.lxOffers) {
+    const okey = ws.pubSerial + ':' + kind + ':' + nonce;
+    const offered = to.lxOffers.get(okey);
+    if (offered && now - offered < 30000) {
+      to.lxOffers.delete(okey);
+      liveCredit(room, ws, to, kind, now);
+    }
+  }
+  lxDeliver(room, to, id, raw, line);
+  metrics.lxRouted++;
+}
+
+/** The lead's game reads a guest's line wrapped, like every guest line; everyone else gets it stamped. */
+function lxDeliver(room, to, id, raw, line) {
+  if (to === room.host) { if (id !== 0) sendToHost(room, JSON.stringify({ relay: 'msg', g: id, m: raw })); }
+  else queueLine(to, line);
+}
+
+/** Both players of an answered interaction earn tonight's points (the same pair and kind once every few minutes). */
+function liveCredit(room, a, b, kind, now) {
+  const pts = LX_POINTS[kind] || 0;
+  if (pts <= 0) return;
+  if (!room.lxPairs) room.lxPairs = new Map();
+  const pair = Math.min(a.pubSerial, b.pubSerial) + '-' + Math.max(a.pubSerial, b.pubSerial) + ':' + kind;
+  if (now - (room.lxPairs.get(pair) || 0) < LX_PAIR_COOLDOWN) return;
+  room.lxPairs.set(pair, now);
+  const why = { hf: 'High five', hug: 'Hug', wv: 'Wave', dn: 'Danced together', kd: 'Kandi trade', gm: 'Played together', ph: 'Group photo' }[kind] || 'Live';
+  addPoints(a, pts, why);
+  addPoints(b, pts, why);
+}
+
+// ---------------------------------------------------------------- Round 97: smooth reconnects
+
+/** A public player's socket closed. A game that can resume (cap 4) and dropped without a goodbye keeps its place a moment. */
+function publicClosed(room, ws, code) {
+  if (ws.pubLeft) return;
+  if ((ws.cap & CAP_RESUME) && ws.pubAccount && code === 1006 && !stopping && RESUME_GRACE_MS > 0 && room.host !== ws && ws.pubId > 0 && room.guests.get(ws.pubId) === ws) {
+    ws.pubHeldUntil = Date.now() + RESUME_GRACE_MS;   // the sweep lets it go after that (everyone else just sees them stand still)
+    flushOut(ws);   // (drops what was waiting: nobody to send it to)
+    metrics.held++;
+    return;
+  }
+  publicDrop(room, ws);
+}
+
+/** The same account is back: it takes over its old number, name, role and figure (nobody saw it leave). Returns the id. */
+function publicResume(room, old, ws) {
+  const id = old.pubId;
+  old.pubLeft = true;   // its own close now does nothing
+  old.pubGone = true;
+  if (old.readyState === 1) {
+    // Silent but open (a phone that lost its signal, or the game that's now back on another device): that one stops for good.
+    send(old, JSON.stringify({ t: 'bye', from: 0, ch: 'relay', text: 'You joined the Open Festival from another device.' }));
+    try { old.close(4001, 'replaced'); } catch { /* gone already */ }
+  }
+  room.guests.set(id, ws);
+  ws.pname = old.pname;
+  ws.role = old.role || 'goer';
+  ws.pubSerial = old.pubSerial;
+  ws.px = old.px;
+  ws.pz = old.pz;
+  ws.lvl = old.lvl;
+  ws.blocks = old.blocks;
+  ws.lxOffers = old.lxOffers;
+  metrics.resumes++;
+  return id;
+}
+
+// ---------------------------------------------------------------- Round 97: shared festival moments and tonight's board
+//
+// One moment at a time, run by this server's clock, for everyone in the Open Festival (games with cap 2):
+//   next  {"relay":"live","k":"next","id":7,"kind":"crowd","role":"","spot":"stage","at":<ms>,"dur":90,"goal":5,"n":0,"now":<ms>}
+//   go    the same, when it starts ("ends": <ms>)
+//   prog  {"relay":"live","k":"prog","id":7,"n":3,"goal":5,...} (when the count changes, at most twice a second, and every 3 s)
+//   done  {"relay":"live","k":"done","id":7,"ok":true,"n":5,...}
+// kinds: crowd (N people dancing at the main stage), drop (THE DROP at the main stage - be there), fireworks (look up),
+// crew (a job for the staff roles together: "role" medic / security / crew; spot medic / gate / stage).
+// A game checks in with {"relay":"lv","id":7} about once a second while its player is taking part (it decides that: dancing
+// at the stage, there for the drop, a staff role at the spot). The relay counts check-ins of the last LIVE_CHECKIN_MS.
+// Points (tonight's board, reset each festival day): taking part 4, a moment won 10, answered interactions (see LX_POINTS).
+
+// (LIVE_KINDS can change the order, e.g. "drop,crowd" - only these four are known.)
+const MOMENT_KINDS = (() => {
+  const known = ['crowd', 'drop', 'crew', 'fireworks'];
+  const wanted = String(process.env.LIVE_KINDS || '').split(',').map(k => k.trim()).filter(k => known.includes(k));
+  return wanted.length ? wanted : known;
+})();
+const MOMENT_SECONDS = { crowd: 90, drop: 30, crew: 90, fireworks: 40 };
+const live = { id: 0, seq: 0, cur: null, next: null, planAt: 0, board: new Map(), boardDay: -1, boardVer: 0, boardSentVer: -1, boardSentAt: 0 };
+
+function publicDay(now) {
+  return Math.floor((now - PUBLIC_EPOCH) / (PUBLIC_DAY_SECONDS * 1000));
+}
+
+function liveLine(k, mo, extra) {
+  return JSON.stringify(Object.assign({ relay: 'live', k, id: mo.id, kind: mo.kind, role: mo.role, spot: mo.spot, at: mo.at, ends: mo.ends || 0, dur: mo.dur, goal: mo.goal, n: mo.n, now: Date.now() }, extra || {}));
+}
+
+function liveAll(room, line) {
+  publicEach(room, ws => { if ((ws.cap & CAP_LIVE) && !ws.pubGone) queueLine(ws, line); });
+}
+
+/** A newcomer (cap 2): the moment that's on or coming, and tonight's board. */
+function liveWelcome(room, ws) {
+  if (live.cur) queueLine(ws, liveLine('go', live.cur));
+  else if (live.next) queueLine(ws, liveLine('next', live.next));
+  queueLine(ws, boardLine(boardTop(), ws));
+}
+
+/** The staff role most players here are playing (medic, security, crew), or null. */
+function busiestStaffRole(room) {
+  const counts = { medic: 0, security: 0, crew: 0 };
+  publicEach(room, ws => { if (!ws.pubGone && counts[ws.role] !== undefined) counts[ws.role]++; });
+  let best = null;
+  for (const role of Object.keys(counts)) if (counts[role] > 0 && (!best || counts[role] > best.count)) best = { role, count: counts[role] };
+  return best;
+}
+
+function planMoment(room, now) {
+  const players = publicPlayers(room);
+  let kind = MOMENT_KINDS[live.seq++ % MOMENT_KINDS.length];
+  let role = '', spot = 'stage', goal = 0;
+  if (kind === 'crew') {
+    const staff = busiestStaffRole(room);
+    if (staff) {
+      role = staff.role;
+      spot = role === 'medic' ? 'medic' : role === 'security' ? 'gate' : 'stage';
+      goal = Math.min(2, staff.count);   // two together when there are two (one on their own can still do it)
+    } else {
+      kind = 'crowd';   // no staff here: a crowd challenge instead
+    }
+  }
+  if (kind === 'crowd') goal = Math.max(1, Math.min(10, Math.ceil(players * 0.5)));
+  live.next = { id: ++live.id, kind, role, spot, at: now + LIVE_LEAD_IN_MS, ends: 0, dur: MOMENT_SECONDS[kind], goal, n: 0, ins: new Map(), progAt: 0 };
+  liveAll(room, liveLine('next', live.next));
+}
+
+function startMoment(room, now) {
+  live.cur = live.next;
+  live.next = null;
+  live.cur.ends = now + live.cur.dur * 1000;
+  metrics.moments++;
+  liveAll(room, liveLine('go', live.cur));
+}
+
+function finishMoment(room, mo, ok, now) {
+  const show = mo.kind === 'drop' || mo.kind === 'fireworks';
+  publicEach(room, ws => {
+    if (ws.pubGone) return;
+    const t = mo.ins.get(ws.pubSerial);
+    if (t === undefined) return;
+    // A show: everyone who was there for it. A challenge: everyone still in it at the end (a win pays more).
+    if (show) addPoints(ws, 4, momentWord(mo));
+    else if (now - t <= LIVE_CHECKIN_MS + 1500) addPoints(ws, ok ? 10 : 4, ok ? momentWord(mo) : 'Took part');
+  });
+  liveAll(room, liveLine('done', mo, { ok }));
+  live.cur = null;
+  live.planAt = now + LIVE_GAP_MS;
+}
+
+function momentWord(mo) {
+  return mo.kind === 'crowd' ? 'Crowd challenge' : mo.kind === 'crew' ? 'Crew call' : mo.kind === 'drop' ? 'The drop' : 'Fireworks';
+}
+
+/** A game says its player is taking part in moment id right now. */
+function liveCheckIn(room, ws, id) {
+  const mo = live.cur;
+  if (!mo || mo.id !== id || ws.pubGone) return;
+  if (mo.kind === 'crew' && ws.role !== mo.role) return;   // the crew call is for that role
+  mo.ins.set(ws.pubSerial, Date.now());
+}
+
+function liveTick(now) {
+  const room = publicRoom;
+  if (publicPlayers(room) === 0) {
+    live.cur = null;
+    live.next = null;
+    live.planAt = 0;
+    live.seq = 0;   // the first moment anyone sees is the crowd challenge
+    if (room.lxPairs) room.lxPairs.clear();
+    return;
+  }
+  if (!live.planAt) live.planAt = now + LIVE_FIRST_MS;
+  if (!live.cur && !live.next && now >= live.planAt) planMoment(room, now);
+  if (live.next && now >= live.next.at) startMoment(room, now);
+  const mo = live.cur;
+  if (mo) {
+    let n = 0;
+    for (const [serial, t] of mo.ins) { if (now - t <= LIVE_CHECKIN_MS) n++; else if (now - t > 60000) mo.ins.delete(serial); }
+    const challenge = mo.kind === 'crowd' || mo.kind === 'crew';
+    if (n !== mo.n || now - mo.progAt >= 3000) {
+      if (n !== mo.n || challenge) { mo.n = n; mo.progAt = now; liveAll(room, liveLine('prog', mo)); }
+    }
+    if (challenge && mo.goal > 0 && n >= mo.goal) finishMoment(room, mo, true, now);
+    else if (now >= mo.ends) finishMoment(room, mo, !challenge && mo.ins.size > 0, now);
+  }
+  boardTick(room, now);
+  if (room.lxPairs && room.lxPairs.size > 2000) {
+    for (const [pair, t] of room.lxPairs) if (now - t >= LX_PAIR_COOLDOWN) room.lxPairs.delete(pair);
+  }
+}
+
+/** Tonight's points for a player (and a "+2 High five" back to them). */
+function addPoints(ws, pts, why) {
+  if (!ws || pts <= 0) return;
+  const now = Date.now();
+  const day = publicDay(now);
+  if (day !== live.boardDay) { live.board.clear(); live.boardDay = day; }
+  const key = blockKey(ws);
+  const entry = live.board.get(key) || { n: ws.pname, r: ws.role || 'goer', p: 0 };
+  entry.p += pts;
+  entry.n = ws.pname;
+  entry.r = ws.role || 'goer';
+  live.board.set(key, entry);
+  if (live.board.size > BOARD_MAX) {
+    let lowKey = null, low = Infinity;
+    for (const [k, e] of live.board) if (e.p < low && k !== key) { low = e.p; lowKey = k; }
+    if (lowKey) live.board.delete(lowKey);
+  }
+  live.boardVer++;
+  if (ws.cap & CAP_LIVE) queueLine(ws, JSON.stringify({ relay: 'live', k: 'pts', p: entry.p, add: pts, why: clip(why, 24) }));
+}
+
+function boardTop() {
+  return Array.from(live.board.entries()).sort((a, b) => b[1].p - a[1].p);
+}
+
+function boardLine(sorted, ws) {
+  const key = blockKey(ws);
+  let rank = 0, me = 0;
+  for (let i = 0; i < sorted.length; i++) if (sorted[i][0] === key) { rank = i + 1; me = sorted[i][1].p; break; }
+  const top = sorted.slice(0, BOARD_TOP).map(([, e]) => ({ n: e.n, p: e.p, r: e.r }));
+  return JSON.stringify({ relay: 'live', k: 'board', top, me, rank, of: sorted.length, day: live.boardDay });
+}
+
+function boardTick(room, now) {
+  if (live.boardVer === live.boardSentVer || now - live.boardSentAt < BOARD_EVERY) return;
+  live.boardSentVer = live.boardVer;
+  live.boardSentAt = now;
+  const sorted = boardTop();
+  publicEach(room, ws => { if ((ws.cap & CAP_LIVE) && !ws.pubGone) queueLine(ws, boardLine(sorted, ws)); });
+}
+
+setInterval(() => {
+  try { liveTick(Date.now()); } catch (err) { console.error('live', err && err.message); }
+}, 1000).unref();
+
+// ---------------------------------------------------------------- Round 97: health
+
+/** GET /metrics: how the server is doing (no names, no addresses). */
+function metricsInfo(req, res) {
+  const headers = { 'content-type': 'application/json', 'cache-control': 'no-store', 'access-control-allow-origin': '*' };
+  if (!publicAskAllowed(req)) { res.writeHead(429, headers); res.end('{"ok":false}'); return; }
+  const mem = process.memoryUsage();
+  let roomCount = 0, roomPlayers = 0, held = 0;
+  for (const room of rooms.values()) {
+    if (room === publicRoom) continue;
+    roomCount++;
+    roomPlayers += room.guests.size + (room.host ? 1 : 0);
+  }
+  for (const ws of publicRoom.guests.values()) if (ws.pubHeldUntil && !ws.pubLeft) held++;
+  res.writeHead(200, headers);
+  res.end(JSON.stringify({
+    ok: true,
+    uptimeS: Math.round(process.uptime()),
+    memoryMB: { rss: Math.round(mem.rss / 1048576), heap: Math.round(mem.heapUsed / 1048576) },
+    rooms: roomCount, roomPlayers,
+    public: { players: publicPlayers(publicRoom), capacity: PUBLIC_CAPACITY, held, moment: live.cur ? live.cur.kind : '', next: live.next ? live.next.kind : '', board: live.board.size },
+    sockets: wss.clients.size,
+    lastMinute: metricsLast,
+    total: Object.assign({}, metrics, { startedAt: undefined }),
+  }));
+}
+
+setInterval(() => {
+  const now = Object.assign({}, metrics);
+  const out = {};
+  for (const k of Object.keys(now)) if (k !== 'startedAt') out[k] = now[k] - (metricsMark[k] || 0);
+  metricsLast = out;
+  metricsMark = now;
+}, 60000).unref();
 
 /** GET /public: the head count, the clock and who plays which role (for the "join" screen). */
 const publicHits = new Map();           // ip -> recent /public and /schedule asks
@@ -1230,6 +1823,8 @@ setInterval(() => {
   // Round 93: a guest gone quiet (a dropped phone signal the pings haven't caught) is let go, so their figure, seat and
   // holds free up for everyone in seconds rather than a minute. A game coming back reconnects by itself.
   for (const guest of Array.from(publicRoom.guests.values())) {
+    // Round 97: a place kept for a dropped connection that didn't come back in time goes now.
+    if (guest.pubHeldUntil && !guest.pubLeft && now >= guest.pubHeldUntil) { publicDrop(publicRoom, guest); continue; }
     if (now - (guest.joinedAt || 0) < PUBLIC_LEAD_GRACE || now - (guest.lastMsgAt || 0) <= PUBLIC_GUEST_SILENT_MS) continue;
     publicDrop(publicRoom, guest);
     try { guest.terminate(); } catch { /* gone already */ }
@@ -1253,6 +1848,13 @@ setInterval(() => {
   for (const [ip, times] of hostTries) if (!times.some(t => now - t < 600000)) hostTries.delete(ip);
   hostTriesAll = hostTriesAll.filter(t => now - t < 600000);
   for (const [ip, times] of worldFails) if (!times.some(t => now - t < 600000)) worldFails.delete(ip);   // Round 63
+  // Round 97: a room whose host has gone silent (a frozen game still answers the pings) with nobody in it is closed.
+  for (const room of rooms.values()) {
+    if (room.isPublic || room.guests.size > 0 || !room.host || now - (room.lastAt || now) < IDLE_HOST_MS) continue;
+    metrics.idleClosed++;
+    send(room.host, JSON.stringify({ t: 'bye', from: 0, text: 'Your online room closed after a long time with no one in it. Host again any time.' }));
+    try { room.host.close(1000, 'idle'); } catch { /* its close handler tidies the room */ }
+  }
   // Round 58: Big Nights that are over (their time is up, or the pass was refunded or ended by the admin).
   for (const room of rooms.values()) {
     if (!room.big) continue;
@@ -1328,6 +1930,10 @@ function handleHttp(req, res) {
     publicSchedule(req, res);
     return;
   }
+  if (pathOnly === '/metrics') {
+    metricsInfo(req, res);   // Round 97: health
+    return;
+  }
   // Round 54: the Festivals list - every listed room and open live event.
   if (req.url && req.url.split('?')[0] === '/rooms') {
     listRooms(req, res);
@@ -1378,7 +1984,13 @@ function handleHttp(req, res) {
   res.end(`Festival Tycoon relay is running. Rooms open: ${rooms.size}\n`);
 }
 
-const wss = new WebSocketServer({ server, maxPayload: MAX_MESSAGE });
+// Round 97: RELAY_DEFLATE=1 compresses big messages for games that ask (web browsers do) - off unless set (it costs memory).
+const wss = new WebSocketServer({
+  server, maxPayload: MAX_MESSAGE,
+  perMessageDeflate: process.env.RELAY_DEFLATE === '1'
+    ? { threshold: 1024, zlibDeflateOptions: { level: 3, memLevel: 6 }, serverMaxWindowBits: 12, serverNoContextTakeover: true, clientNoContextTakeover: true, concurrencyLimit: 4 }
+    : false
+});
 
 // Round 71: the play-stats dashboard shows who's online in the relay right now.
 analytics.attach({
@@ -1396,7 +2008,9 @@ analytics.attach({
 function send(ws, text) {
   if (!ws || ws.readyState !== 1) return;
   if (ws.bufferedAmount > MAX_BUFFERED) { ws.terminate(); return; }
+  if (ws.outbox && ws.outbox.length) flushOut(ws);   // Round 97: what was batched for them goes first (lines keep their order)
   ws.send(text);
+  metrics.linesOut++; metrics.framesOut++; metrics.bytesOut += text.length;
 }
 
 wss.on('connection', (ws, req) => {
@@ -1422,6 +2036,10 @@ wss.on('connection', (ws, req) => {
   }
 
   if (url.pathname === '/host') {
+    // Round 109: a live account first (see liveAccountFor).
+    const live = liveAccountFor(url);
+    if (!live.ok) { refuseForAccount(ws, live.text); return; }
+    ws.account = live.account;
     // Round 50: opening a live event needs the organiser's password, the switch on, and the event listed.
     const eventId = url.searchParams.has('event') ? cleanId(url.searchParams.get('event')) : '';
     if (eventId) {
@@ -1451,7 +2069,7 @@ wss.on('connection', (ws, req) => {
       if (fails.length >= WORLD_FAILS_PER_10_MIN) { refuse('Too many tries - wait ten minutes.'); return; }
       const worldId = String(url.searchParams.get('world') || '').slice(0, 32);
       try {
-        opened = worlds.openFor(worldId, String(url.searchParams.get('wkey') || '').slice(0, 80));
+        opened = worlds.openFor(worldId, String(url.searchParams.get('wkey') || '').slice(0, 80), ws.account || '');   // Round 109: + the live account
       } catch (err) {
         console.error('worlds open', err && err.message);
         opened = { ok: false, text: 'That world could not be opened just now - try again.' };
@@ -1480,7 +2098,10 @@ wss.on('connection', (ws, req) => {
     patchbay.roomOpened(targetOf(code, room));   // Round 60: stages already patched for this event play straight away
     sendPatches(ws, code, room);
 
+    room.lastAt = Date.now();   // Round 97: when the host last said anything (a silent host with nobody in is closed)
     ws.on('message', (data) => {
+      room.lastAt = Date.now();
+      metrics.msgsIn++;
       if (isVoice(data)) { relayVoice(room, 0, ws, data); return; }   // Round 54
       let packet;
       try { packet = JSON.parse(data.toString()); } catch { return; }
@@ -1545,6 +2166,8 @@ wss.on('connection', (ws, req) => {
       }
       if (typeof packet.m !== 'string') return;
       if (packet.m.startsWith('{"relay"')) return;   // Round 60: only the server speaks as the server
+      if (hasLineBreak(packet.m)) return;            // Round 97 (review): never two lines in one (see the public lead's rule)
+      if (packet.m.startsWith('m:') && !MIC_LINE_RE.test(packet.m)) return;
       if (packet.m.startsWith('m:') && (packet.to === -1 || packet.to === undefined)) {
         // Round 61: an open-mic line from the host (its own mic, or a guest's it passed on): like voice, a listener
         // who is behind skips it rather than queueing it up.
@@ -1583,6 +2206,10 @@ wss.on('connection', (ws, req) => {
   }
 
   if (url.pathname === '/join') {
+    // Round 109: a live account first - before any code or ticket is looked at (see liveAccountFor).
+    const live = liveAccountFor(url);
+    if (!live.ok) { refuseForAccount(ws, live.text); return; }
+    ws.account = live.account;
     let code = (url.searchParams.get('code') || '').toUpperCase().trim();
     let ticketKey = null;
     // Round 50: a fan joining a live event: find its room, and check their ticket.

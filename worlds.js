@@ -21,6 +21,11 @@
 // The game opens a world by hosting with /host?world=<id>&wkey=<key> (see relay.js); the host's game then sends
 // {"wsave":{"s":"<section>","d":"<text>"}} as things change, and {"wpeople":[{"t":tag,"n":name},...]}.
 //
+// Round 109: ONLINE WORLDS NEED A LIVE ACCOUNT (like every online room - relay.js liveAccountFor). Every /worlds/* call
+// except /worlds/status carries the game's live sign-in: "Authorization: Bearer <token>" (or "pt" in the body). A game from
+// before Round 109 sends neither and is told to update; an unknown key gets 401 {signin:true}. LIVE_SIGNUP_REQUIRED=0
+// switches it off. The world key (who owns which world) is unchanged.
+//
 // FILES: in WORLDS_DIR, else STORE_DATA_DIR/worlds (the persistent disk the store already uses), else next to this
 // file (a free Render server forgets those on every restart - worlds then only last until the next restart).
 //   worlds-index.json   every world's details (no sections) - written whole to a temp file, then renamed
@@ -117,6 +122,7 @@ function cleanMeta(m) {
     people: (Array.isArray(m.people) ? m.people : []).map(cleanPerson).filter(Boolean).slice(0, MAX_PEOPLE),
     bytes: Math.max(0, num(m.bytes) | 0),
     sections: (Array.isArray(m.sections) ? m.sections : []).filter(validSection).slice(0, MAX_SECTIONS),
+    liveUid: typeof m.liveUid === 'string' && /^u[0-9a-f]{24}$/.test(m.liveUid) ? m.liveUid : '',   // Round 109: the owning live account's uid
   };
 }
 
@@ -313,18 +319,31 @@ function sweep() {
 }
 
 // ============================================================================ who may do what
-function isOwner(m, tag) { return !!tag && m.owner === tag; }
-function canHost(m, tag) { return !!tag && (m.owner === tag || m.hosts.some(h => h.t === tag)); }
+// Round 109: SAVED WORLDS FOLLOW THE LIVE ACCOUNT. A world can carry "liveUid": the uid of the live account that owns it
+// (review H1/M1: the account's immutable uid, never its username - a deleted name signed up again owns nothing; deleting
+// the account deletes its worlds, removeOwnedBy). Set when it's made, and, for a world from before Round 109, when its
+// owner's game claims it (POST /worlds/claim - review L1: only after the player said yes on that device; /worlds/mine
+// tells the game how many are waiting, "unclaimed"). From then on the ACCOUNT owns it: any device signed in to that account sees it,
+// hosts it, renames it... (its own world key there doesn't matter), and the original world key stops being enough on its
+// own - a world linked to one account is never handed to anyone signed in as another. An unlinked world (nobody signed in
+// yet), or a server with accounts switched off (LIVE_SIGNUP_REQUIRED=0), works by the world key exactly as before.
+// Friends allowed to host (m.hosts) are still known by their world tag.
+function isOwner(m, tag, live) {
+  if (live && m.liveUid) return m.liveUid === live;
+  if (m.liveUid && !live && require('./players').required()) return false;   // (linked, and this caller isn't signed in)
+  return !!tag && m.owner === tag;
+}
+function canHost(m, tag, live) { return isOwner(m, tag, live) || (!!tag && m.hosts.some(h => h.t === tag)); }
 function hasPlayed(m, tag) { return !!tag && m.people.some(p => p.t === tag); }
 
 /** One world as a player sees it in their list. */
-function view(m, tag) {
-  const owner = isOwner(m, tag);
+function view(m, tag, live) {
+  const owner = isOwner(m, tag, live);
   const open = hooks.openInfo(m.id);
   const out = {
     id: m.id, name: m.name, region: m.region, site: m.site,
     created: m.created, updated: m.updated, played: m.played,
-    mine: owner, canHost: canHost(m, tag), open: !!open,
+    mine: owner, canHost: canHost(m, tag, live), open: !!open,
     code: open ? open.code : '', players: open ? open.players : 0,
     by: m.ownerName,
     people: m.people.slice(0, 12).map(p => p.n),
@@ -391,26 +410,30 @@ function readBody(req, res, then) {
   });
 }
 
-function mine(body) {
+function mine(body, ip, live) {
   const tag = tagOf(body.key);
   if (!tag) return [400, { ok: false, message: 'Your game sent a bad world key.' }];
   const out = [];
+  let unclaimed = 0;
   for (const m of metas.values()) {
-    if (canHost(m, tag) || hasPlayed(m, tag)) out.push(view(m, tag));
+    // Round 109 (review L1): this device's own worlds from before accounts are NOT linked here - the game asks the player
+    // first ("Add them to <username>?") and then claims them (/worlds/claim).
+    if (live && !m.liveUid && m.owner === tag) unclaimed++;
+    if (canHost(m, tag, live) || hasPlayed(m, tag)) out.push(view(m, tag, live));
   }
   // Open ones first, then yours, then the most recently played.
   out.sort((a, b) => (b.open - a.open) || (b.mine - a.mine) || (Math.max(b.played, b.updated) - Math.max(a.played, a.updated)));
-  return [200, { ok: true, me: tag, saving: PERSISTENT, perPlayer: PER_OWNER, worlds: out.slice(0, 40) }];
+  return [200, { ok: true, me: tag, saving: PERSISTENT, perPlayer: PER_OWNER, worlds: out.slice(0, 40), unclaimed }];
 }
 
-function create(body, ip) {
+function create(body, ip, live) {
   const tag = tagOf(body.key);
   if (!tag) return [400, { ok: false, message: 'Your game sent a bad world key.' }];
   if (!ready) return [503, { ok: false, message: 'Saved worlds aren\'t available on this server right now.' }];
   const name = cleanWorldName(body.name);
   if (!name) return [400, { ok: false, message: 'Pick a different name for your world (2-32 letters, nothing rude).' }];
   let owned = 0;
-  for (const m of metas.values()) if (m.owner === tag) owned++;
+  for (const m of metas.values()) if (live ? m.liveUid === live || (!m.liveUid && m.owner === tag) : m.owner === tag) owned++;   // Round 109: per account
   if (owned >= PER_OWNER) return [409, { ok: false, message: `You have ${PER_OWNER} saved worlds already - delete one first.` }];
   if (metas.size >= MAX_WORLDS) sweep();
   if (metas.size >= MAX_WORLDS || totalBytes >= MAX_TOTAL) return [503, { ok: false, message: 'The server has no room for new worlds right now - try again another day.' }];
@@ -419,44 +442,44 @@ function create(body, ip) {
   createAll.push(now());
   let id;
   do { id = crypto.randomBytes(8).toString('hex'); } while (metas.has(id));
-  const m = cleanMeta({ id, name, owner: tag, ownerName: body.by, region: body.region, site: body.site, created: now(), hosts: [], people: [], bytes: 0 });
+  const m = cleanMeta({ id, name, owner: tag, ownerName: body.by, region: body.region, site: body.site, created: now(), hosts: [], people: [], bytes: 0, liveUid: live || '' });   // Round 109: + the owning account (its uid)
   metas.set(id, m);
   cache.set(id, new Map());
   saveWorldSoon(id);
   saveIndexSoon();
-  return [200, { ok: true, world: view(m, tag) }];
+  return [200, { ok: true, world: view(m, tag, live) }];
 }
 
-function ownedWorld(body) {
+function ownedWorld(body, live) {
   const tag = tagOf(body.key);
   if (!tag) return { error: [400, { ok: false, message: 'Your game sent a bad world key.' }] };
   const m = validId(body.id) ? metas.get(body.id) : null;
   if (!m) return { error: [404, { ok: false, message: 'That world isn\'t on this server any more.' }] };
-  if (!isOwner(m, tag)) return { error: [403, { ok: false, message: 'Only the world\'s owner can do that.' }] };
+  if (!isOwner(m, tag, live)) return { error: [403, { ok: false, message: 'Only the world\'s owner can do that.' }] };
   return { m, tag };
 }
 
-function rename(body) {
-  const { m, tag, error } = ownedWorld(body);
+function rename(body, ip, live) {
+  const { m, tag, error } = ownedWorld(body, live);
   if (error) return error;
   const name = cleanWorldName(body.name);
   if (!name) return [400, { ok: false, message: 'Pick a different name (2-32 letters, nothing rude).' }];
   m.name = name;
   saveIndexSoon();
   if (cache.has(m.id)) saveWorldSoon(m.id);   // the world's own file keeps its details too (the list can be rebuilt from it)
-  return [200, { ok: true, world: view(m, tag) }];
+  return [200, { ok: true, world: view(m, tag, live) }];
 }
 
-function remove(body) {
-  const { m, error } = ownedWorld(body);
+function remove(body, ip, live) {
+  const { m, error } = ownedWorld(body, live);
   if (error) return error;
   if (hooks.openInfo(m.id)) return [409, { ok: false, message: 'Close the world first (it\'s open right now).' }];
   removeWorld(m.id);
   return [200, { ok: true }];
 }
 
-function grant(body) {
-  const { m, tag, error } = ownedWorld(body);
+function grant(body, ip, live) {
+  const { m, tag, error } = ownedWorld(body, live);
   if (error) return error;
   if (!validTag(body.tag) || body.tag === m.owner) return [400, { ok: false, message: 'Pick a friend who has played in this world.' }];
   const on = body.on === true;
@@ -467,14 +490,55 @@ function grant(body) {
   }
   saveIndexSoon();
   if (cache.has(m.id)) saveWorldSoon(m.id);
-  return [200, { ok: true, world: view(m, tag) }];
+  return [200, { ok: true, world: view(m, tag, live) }];
 }
 
-const ROUTES = { '/worlds/mine': mine, '/worlds/create': create, '/worlds/rename': rename, '/worlds/delete': remove, '/worlds/grant': grant };
+/**
+ * Round 109 (review L1): the player said yes - "This device has M worlds from before accounts. Add them to <username>?" -
+ * so this device's worlds that no account owns yet become this account's. Never one another account owns.
+ */
+function claim(body, ip, live) {
+  const tag = tagOf(body.key);
+  if (!tag) return [400, { ok: false, message: 'Your game sent a bad world key.' }];
+  if (!live) return [400, { ok: false, message: 'Sign in to your live account first.' }];
+  let n = 0;
+  for (const m of metas.values()) {
+    if (m.liveUid || m.owner !== tag) continue;
+    m.liveUid = live;
+    persistMeta(m.id);
+    n++;
+  }
+  if (n) saveIndexSoon();
+  return [200, { ok: true, claimed: n }];
+}
+
+/** Round 109 (review L7): a world's ownership is written into its own file too (the index can be rebuilt from those). */
+function persistMeta(id) {
+  if (sectionsOf(id)) saveWorldSoon(id);   // (loads it if it isn't in memory, so its file is rewritten with the new details)
+}
+
+/** Round 109 (review M1): a live account was deleted - its saved worlds go with it, straight away. How many. */
+function removeOwnedBy(uid) {
+  if (!uid) return 0;
+  let n = 0;
+  for (const m of Array.from(metas.values())) {
+    if (m.liveUid !== uid) continue;
+    removeWorld(m.id);
+    n++;
+  }
+  return n;
+}
+
+const ROUTES = { '/worlds/claim': claim, '/worlds/mine': mine, '/worlds/create': create, '/worlds/rename': rename, '/worlds/delete': remove, '/worlds/grant': grant };
 
 function ipOf(req) {
   const forwarded = (req.headers['x-forwarded-for'] || '').toString().split(',').map(s => s.trim()).filter(Boolean);
   return forwarded.length ? forwarded[forwarded.length - 1] : (req.socket.remoteAddress || '');
+}
+
+/** Round 109: the live account behind this call (players.gate) - {ok, account} or {ok:false, status, reply}. */
+function liveGate(req, body) {
+  return require('./players').gate(req, body, 'use online worlds');   // (lazy: relay.js loads both)
 }
 
 /** Handles /worlds/...; false for anything else. */
@@ -482,7 +546,7 @@ function handle(req, res) {
   const route = String(req.url || '').split('?')[0];
   if (!route.startsWith('/worlds/')) return false;
   if (req.method === 'OPTIONS') {
-    res.writeHead(204, { 'access-control-allow-origin': '*', 'access-control-allow-methods': 'GET, POST', 'access-control-allow-headers': 'content-type' });
+    res.writeHead(204, { 'access-control-allow-origin': '*', 'access-control-allow-methods': 'GET, POST', 'access-control-allow-headers': 'content-type, authorization' });   // Round 109: + the live sign-in
     res.end();
     return true;
   }
@@ -497,7 +561,9 @@ function handle(req, res) {
   const limited = fn === mine ? !allow(readHits, ip, READS_PER_MINUTE, 60000) : !allow(writeHits, ip, WRITES_PER_MINUTE, 60000);
   if (limited) { reply(res, 429, { ok: false, message: 'Lots of requests - wait a moment.' }); return true; }
   readBody(req, res, (body) => {
-    const [status, obj] = fn(body, ip);
+    const gate = liveGate(req, body);   // Round 109
+    if (!gate.ok) { reply(res, gate.status, gate.reply); return; }
+    const [status, obj] = fn(body, ip, gate.account);   // Round 109: + the live account (worlds follow it)
     reply(res, status, obj);
   });
   return true;
@@ -513,17 +579,17 @@ function attach(h) {
  * A host opens a world: may they, and what's in it? -> { ok, text, meta, owner, sections: [[name, text], ...] }.
  * text is short (it may become a WebSocket close reason, which holds 123 bytes).
  */
-function openFor(id, key) {
+function openFor(id, key, live) {   // Round 109: + the host's live account (relay.js: the /host sign-in)
   if (!ready) return { ok: false, text: 'Saved worlds are not available on this server.' };
   const tag = tagOf(key);
   const m = validId(id) ? metas.get(id) : null;
   if (!m) return { ok: false, text: 'That saved world is not on this server any more.' };
-  if (!canHost(m, tag)) return { ok: false, text: 'Only its owner (or friends they allow) can host that world.' };
+  if (!canHost(m, tag, live)) return { ok: false, text: 'Only its owner (or friends they allow) can host that world.' };
   const secs = sectionsOf(id);
   if (!secs) return { ok: false, text: 'That world could not be read just now - try again later.' };
   m.played = now();
   saveIndexSoon();
-  return { ok: true, meta: m, owner: isOwner(m, tag), tag, sections: Array.from(secs.entries()) };
+  return { ok: true, meta: m, owner: isOwner(m, tag, live), tag, sections: Array.from(secs.entries()) };
 }
 
 const saveBuckets = new Map();   // id -> { at, count, bytes } this minute
@@ -600,6 +666,6 @@ function listingFor(id) {
 load();
 
 module.exports = {
-  handle, attach, openFor, saveSection, notePeople, closed, listingFor, flush, tagOf,
+  handle, attach, openFor, saveSection, notePeople, closed, listingFor, flush, tagOf, removeOwnedBy,   // Round 109: + removeOwnedBy
   _test: { metas, cache, sweep, cleanText, cleanWorldName, DIR, PERSISTENT }
 };
