@@ -75,6 +75,21 @@
 //  - LIVE_ACCOUNT_GRACE_UNTIL=<ISO date> (optional): until then, older games (no account at all) may still host and join
 //    rooms and use worlds / the world boards, so the server can go out before every player has updated. /players/status
 //    says {grace, graceUntil}. (The Open Festival needed accounts already and isn't affected.)
+//
+// Round 111 (acct111) - SIGN-INS LAST 3 DAYS (the owner chose "3 days logged in"). Build 110 let his phone straight into
+// live play on a sign-in key from months before: keys never ran out, so the game never asked him to sign up or sign in.
+//  - Every sign-in key now runs out SESSION_DAYS (3) days after the sign-in / sign-up / password change that made it. FIXED,
+//    not sliding: playing every day doesn't stretch it - after 3 days the player signs in again. (Change SESSION_DAYS below
+//    - the one place.) Each key's issue time is kept with the account (p.tokenAt: key hash -> ms), so it survives restarts,
+//    the disk and the GitHub backup like everything else.
+//  - A key that ran out is refused with 401 {ok:false, signin:true, expired:true} everywhere a key is read (/players/me,
+//    /players/ticket - so no new connection tickets either -, progress, store-link, password, agree, delete, worlds, the
+//    boards, the relay), and pruned from the account (on use, at start-up and every hour).
+//  - Keys from before this update have no issue time, so they count as run out: EVERYONE signs in again once on Build 111
+//    (older games get the same 401 and their own "sign in again" screen).
+//  - Sign-up / sign-in / password replies and /players/me say when the key runs out: {expires (ms since 1970), expiresIn
+//    (ms from now), sessionDays}. /players/status says sessionDays too.
+//  - Tests only: NMSD_TEST_CLOCK_OFFSET_MS moves this file's session clock (never set it on the real server).
 
 const fs = require('fs');
 const path = require('path');
@@ -87,7 +102,10 @@ const DIR = process.env.STORE_DATA_DIR || __dirname;
 const FILE = path.join(DIR, 'players.json');
 const BAK = FILE + '.bak';
 const MAX_PLAYERS = 500000;
-const MAX_TOKENS = 8;
+const MAX_TOKENS = 8;                  // sign-in keys kept per account (one per device; the oldest goes first)
+// Round 111 (acct111): HOW LONG A SIGN-IN LASTS, in days - the one number to change. Fixed from the sign-in (not sliding).
+const SESSION_DAYS = 3;
+const SESSION_MS = SESSION_DAYS * 24 * 60 * 60 * 1000;
 const MAX_PROGRESS_BODY = 128 * 1024;  // Round 75: one progress sync (both blobs together). Round 109: 128 KB (+ identity, swag)
 const MAX_ROLE = 16;
 const MAX_IDENTITY = 16 * 1024;        // Round 109: the character (PlayerIdentity + the look) - a few KB in practice
@@ -124,12 +142,75 @@ function index() {
   byEmail = new Map();
   byToken = new Map();
   byUid = new Map();
+  const at = clock();
   for (const [key, p] of Object.entries(state.players)) {
     if (p.email) byEmail.set(p.email, key);
+    if (pruneTokens(p, key, at)) dirty = true;   // Round 111: keys that ran out (or from before issue times) go
     for (const t of p.tokens || []) byToken.set(t, key);
     if (p.uid) byUid.set(p.uid, key);
   }
 }
+
+// ------------------------------------------------------------------ Round 111 (acct111): sign-ins last SESSION_DAYS days
+
+/** Tests only: NMSD_TEST_CLOCK_OFFSET_MS moves the session clock (a 72 h test without waiting 72 h). */
+const CLOCK_OFFSET = (() => { if (process.env.RENDER) return 0; const n = Number(process.env.NMSD_TEST_CLOCK_OFFSET_MS || 0); return Number.isFinite(n) ? n : 0; })();   // Round 111: never on Render
+if (CLOCK_OFFSET) console.warn(`players: NMSD_TEST_CLOCK_OFFSET_MS=${CLOCK_OFFSET} - the session clock is moved (tests only - never on the real server)`);
+function clock() { return Date.now() + CLOCK_OFFSET; }
+
+/** When this key (its hash) was made - 0 for a key from before Round 111 (no issue time: it counts as run out). */
+function tokenIssued(p, hash) {
+  const t = p && p.tokenAt && typeof p.tokenAt === 'object' ? Number(p.tokenAt[hash]) : 0;
+  return Number.isFinite(t) && t > 0 ? t : 0;
+}
+
+/** Still good at <at>? (Fixed expiry: SESSION_MS after it was made.) */
+function tokenLive(p, hash, at) {
+  const t = tokenIssued(p, hash);
+  return t > 0 && (at === undefined ? clock() : at) < t + SESSION_MS;
+}
+
+/** {expires, expiresIn, sessionDays} for a key - what the game keeps to know when to ask for a sign-in again. */
+function sessionOf(p, hash) {
+  const expires = tokenIssued(p, hash) + SESSION_MS;
+  return { expires, expiresIn: Math.max(0, expires - clock()), sessionDays: SESSION_DAYS };
+}
+
+// Keys that ran out recently (hash -> ms), so their 401 can still say "expired" after they're pruned (in memory only; the
+// oldest go first past MAX_EXPIRED - after that a refusal is a plain "sign in", which the game treats the same way).
+const expiredKeys = new Map();
+const MAX_EXPIRED = 50000;
+function noteExpired(hash) {
+  expiredKeys.delete(hash);
+  expiredKeys.set(hash, Date.now());
+  while (expiredKeys.size > MAX_EXPIRED) expiredKeys.delete(expiredKeys.keys().next().value);
+}
+
+/** Drops this account's keys that ran out (and stray issue times). True when something changed. */
+function pruneTokens(p, key, at) {
+  if (!p || typeof p !== 'object') return false;
+  const list = Array.isArray(p.tokens) ? p.tokens : [];
+  const keep = [], times = {};
+  let changed = !Array.isArray(p.tokens) || (p.tokenAt !== undefined && (typeof p.tokenAt !== 'object' || p.tokenAt === null));
+  for (const t of list) {
+    if (typeof t === 'string' && tokenLive(p, t, at)) { keep.push(t); times[t] = tokenIssued(p, t); continue; }
+    changed = true;
+    if (typeof t === 'string') { noteExpired(t); if (byToken.get(t) === key) byToken.delete(t); }
+  }
+  const before = p.tokenAt && typeof p.tokenAt === 'object' ? Object.keys(p.tokenAt).length : 0;
+  if (before !== keep.length) changed = true;
+  if (changed) { p.tokens = keep; p.tokenAt = times; }
+  return changed;
+}
+
+/** Every hour: keys that ran out leave the accounts (and the next save). */
+setInterval(() => {
+  if (!ready) return;
+  const at = clock();
+  let n = 0;
+  for (const [key, p] of Object.entries(state.players)) if (pruneTokens(p, key, at)) n++;
+  if (n) save(false);
+}, 3600000).unref();
 
 function count(data) { return data && data.players ? Object.keys(data.players).length : 0; }
 
@@ -505,30 +586,71 @@ function checkPassword(pw, stored) {
   });
 }
 
+/** A new sign-in key for this account (Round 111: stamped now - it runs out SESSION_DAYS days from now). Returns the key;
+ *  sessionOf(p, sha('pt|' + key)) says when it runs out. */
 function newToken(p) {
+  const key = p.username.toLowerCase();
+  pruneTokens(p, key, clock());   // Round 111: (keys that ran out don't take a device's place)
   const token = crypto.randomBytes(24).toString('hex');
   const hash = sha('pt|' + token);
   p.tokens = (p.tokens || []).concat(hash);
-  while (p.tokens.length > MAX_TOKENS) byToken.delete(p.tokens.shift());
-  byToken.set(hash, p.username.toLowerCase());
+  p.tokenAt = Object.assign({}, p.tokenAt || {}, { [hash]: clock() });
+  while (p.tokens.length > MAX_TOKENS) {
+    const old = p.tokens.shift();
+    byToken.delete(old);
+    delete p.tokenAt[old];
+  }
+  byToken.set(hash, key);
   return token;
 }
+
+/** The reply fields for a key just made: Round 111 - {token, expires, expiresIn, sessionDays}. */
+function issued(p, token) { return Object.assign({ token }, sessionOf(p, sha('pt|' + token))); }
 
 function dropTokens(p) {
   for (const t of p.tokens || []) byToken.delete(t);
   p.tokens = [];
+  p.tokenAt = {};   // Round 111
 }
 
-/** The account a device token belongs to (or null). */
-function check(token) {
-  if (!ready || !token || typeof token !== 'string' || token.length < 20 || token.length > 100) return null;
-  const key = byToken.get(sha('pt|' + token));
-  return key ? state.players[key] || null : null;
+/**
+ * Round 111: a device key -> {p (the account, or null), hash, expired}. A key that ran out (SESSION_DAYS after it was made,
+ * or from before Round 111 with no issue time) is pruned right here and answers {p: null, expired: true}.
+ */
+function checkWhy(token) {
+  if (!ready || !token || typeof token !== 'string' || token.length < 20 || token.length > 100) return { p: null, expired: false };
+  const hash = sha('pt|' + token);
+  const key = byToken.get(hash);
+  const p = key ? state.players[key] || null : null;
+  if (p) {
+    if (tokenLive(p, hash)) return { p, hash, expired: false };
+    if (pruneTokens(p, key, clock())) save(false);
+    noteExpired(hash);
+    return { p: null, hash, expired: true };
+  }
+  return { p: null, hash, expired: expiredKeys.has(hash) };
 }
 
-function byBearer(req) {
+/** The account a device token belongs to (or null - unknown, signed out, or Round 111: run out). */
+function check(token) { return checkWhy(token).p; }
+
+function bearerOf(req) {
   const auth = String(req.headers.authorization || '');
-  return check(auth.startsWith('Bearer ') ? auth.slice(7).trim() : '');
+  return auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
+}
+
+function byBearer(req) { return check(bearerOf(req)); }
+
+/** Round 111: the account behind "Authorization: Bearer", with why not ({p, hash, expired}). */
+function byBearerWhy(req) { return checkWhy(bearerOf(req)); }
+
+/** Round 111: the one 401 for a key that isn't good: {ok:false, signin:true, required, message} (+ expired:true when it ran out). */
+function signinReply(why, extra) {
+  const expired = !!(why && why.expired);
+  return Object.assign({
+    ok: false, signin: true, required: required(),
+    message: expired ? `Your sign-in ran out (they last ${SESSION_DAYS} days) - please sign in again.` : 'Please sign in again.'
+  }, expired ? { expired: true } : {}, extra || {});
 }
 
 const hits = new Map();
@@ -537,8 +659,16 @@ function limited(key, max, ms) {
   const list = (hits.get(key) || []).filter(t => now - t < ms);
   list.push(now);
   hits.set(key, list);
-  if (hits.size > 20000) hits.clear();
+  if (hits.size > 20000) trimHits(now);   // Round 111 (sec111): trimmed, never wiped - a flood of keys can't reset everyone's limits
   return list.length > max;
+}
+
+/** Round 111 (sec111): drops entries with no hit in the last 2 hours, then (still too many) the oldest-made keys. */
+function trimHits(now) {
+  for (const [k, list] of hits) if (!list.length || now - list[list.length - 1] > 7200000) hits.delete(k);
+  if (hits.size <= 15000) return;
+  let drop = hits.size - 15000;
+  for (const k of hits.keys()) { if (drop-- <= 0) break; hits.delete(k); }
 }
 
 /** Over the limit already (without counting this one). */
@@ -649,8 +779,9 @@ function readJsonOrTooBig(req, limit) {
 }
 
 function progressRoute(req, res) {
-  const p = byBearer(req);
-  if (!p) { json(res, 401, { ok: false, error: 'sign in' }); return; }
+  const why = byBearerWhy(req);   // Round 111
+  const p = why.p;
+  if (!p) { json(res, 401, signinReply(why, { error: 'sign in' })); return; }
   if (req.method === 'GET') { json(res, 200, Object.assign({ ok: true }, progressOf(p))); return; }
   if (req.method !== 'POST') { json(res, 405, { ok: false, error: 'use GET or POST' }); return; }
   const key = p.username.toLowerCase();
@@ -713,7 +844,7 @@ function handle(req, res) {
   if (route === '/players/status') {
     if (peek('status|' + ipOf(req), 60, 60000)) { json(res, 429, { ok: false, message: 'Slow down a little.' }); return true; }
     limited('status|' + ipOf(req), 60, 60000);
-    json(res, 200, { ok: true, ready, required: required(), grace: required() && graceActive(), graceUntil: graceUntil() ? new Date(graceUntil()).toISOString() : '' });   // Round 109: + the grace switch
+    json(res, 200, { ok: true, ready, required: required(), grace: required() && graceActive(), graceUntil: graceUntil() ? new Date(graceUntil()).toISOString() : '', sessionDays: SESSION_DAYS });   // Round 109: + the grace switch. Round 111: + how long a sign-in lasts
     return true;
   }
 
@@ -725,14 +856,15 @@ function handle(req, res) {
   if (route === '/players/ticket') { ticketRoute(req, res, ip); return true; }   // Round 109 (review L4)
 
   if (route === '/players/me') {
-    const p = byBearer(req);
-    if (!p) { json(res, 401, { ok: false, message: 'Please sign in again.', required: required() }); return true; }
+    const why = byBearerWhy(req);   // Round 111: a key that ran out -> 401 {signin, expired}
+    const p = why.p;
+    if (!p) { json(res, 401, signinReply(why)); return true; }
     p.seen = now();
     // Round 109: the game says what it is (the admin page's "last device"); a new device is worth an off-site backup soon.
     let device = '';
     try { device = new URL(req.url, 'http://x').searchParams.get('device') || ''; } catch { /* */ }
     save(noteDevice(p, device) ? 60000 : false);
-    json(res, 200, { ok: true, username: p.username, email: p.email, uid: p.uid, termsOk: !!(p.terms && p.terms.version === TERMS_VERSION), terms: TERMS_VERSION, required: required(), store: p.store ? p.store.id : '' });
+    json(res, 200, Object.assign({ ok: true, username: p.username, email: p.email, uid: p.uid, termsOk: !!(p.terms && p.terms.version === TERMS_VERSION), terms: TERMS_VERSION, required: required(), store: p.store ? p.store.id : '' }, sessionOf(p, why.hash)));   // Round 111: + when this key runs out
     return true;
   }
 
@@ -748,6 +880,8 @@ async function route2(route, req, res, body, ip) {
   switch (route) {
     case '/players/signup': {
       if (peek('up|' + ip, 20, 3600000)) return json(res, 429, { ok: false, message: 'Too many new accounts from this network - try again later.' });
+      // Round 111 (sec111 L3): every sign-up try counts here too, so "is this email / username taken?" can't be asked endlessly.
+      if (limited('uptry|' + ip, 60, 3600000)) return json(res, 429, { ok: false, message: 'Too many tries from this network - wait a while and try again.' });
       const username = cleanUsername(body.username);
       const email = cleanEmail(body.email);
       const key = username.toLowerCase();
@@ -775,7 +909,7 @@ async function route2(route, req, res, body, ip) {
       // Round 109 (review H1): the old tombstone for this name STAYS - it only ever matches the deleted person's records
       // (made before it), so nothing of theirs can come back into this new account from a backup.
       save();
-      return json(res, 200, { ok: true, username, email, token, uid: p.uid });
+      return json(res, 200, Object.assign({ ok: true, username, email, uid: p.uid }, issued(p, token)));   // Round 111: + expires, expiresIn, sessionDays
     }
 
     case '/players/signin': {
@@ -783,22 +917,26 @@ async function route2(route, req, res, body, ip) {
       const login = String(body.login || body.username || '').trim();
       const key = login.includes('@') ? byEmail.get(cleanEmail(login)) : cleanUsername(login).toLowerCase();
       const p = key ? state.players[key] : null;
-      if (p && peek('acct|' + key + '|' + ip, 10, 3600000)) return json(res, 429, { ok: false, message: `Too many wrong passwords - wait an hour, or email ${CONTACT} to reset it.` });
+      // Round 111 (sec111 L3): the per-login limit goes by the words typed, whether or not that account exists - the same
+      // reply either way, so it can't be used to find out which usernames / emails have accounts.
+      const tried = login.toLowerCase().slice(0, 120);
+      if (peek('acct|' + tried + '|' + ip, 10, 3600000)) return json(res, 429, { ok: false, message: `Too many wrong passwords - wait an hour, or email ${CONTACT} to reset it.` });
       const okPass = p ? await checkPassword(body.password, p.pass) : await checkPassword(body.password, 's1$AAAAAAAAAAAAAAAAAAAAAA==$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=');   // (same time either way)
       if (!p || !okPass) {
         limited('in|' + ip, 50, 3600000);   // (only wrong tries count)
-        if (p) limited('acct|' + key + '|' + ip, 10, 3600000);
+        limited('acct|' + tried + '|' + ip, 10, 3600000);   // Round 111 (sec111 L3)
       }
       if (!p || !okPass) return json(res, 401, { ok: false, field: 'password', message: `That username / email and password don't match. Forgot your password? Email ${CONTACT} and we'll reset it.` });
       const token = newToken(p);
       p.seen = now();
       save(noteDevice(p, body.device) ? 60000 : false);   // Round 109: + the last device
-      return json(res, 200, { ok: true, username: p.username, email: p.email, token, uid: p.uid, termsOk: !!(p.terms && p.terms.version === TERMS_VERSION) });
+      return json(res, 200, Object.assign({ ok: true, username: p.username, email: p.email, uid: p.uid, termsOk: !!(p.terms && p.terms.version === TERMS_VERSION) }, issued(p, token)));   // Round 111: + expires, expiresIn, sessionDays
     }
 
     case '/players/password': {
-      const p = byBearer(req);
-      if (!p) return json(res, 401, { ok: false, message: 'Please sign in again.' });
+      const why = byBearerWhy(req);   // Round 111
+      const p = why.p;
+      if (!p) return json(res, 401, signinReply(why));
       if (limited('pw|' + p.username.toLowerCase(), 10, 3600000)) return json(res, 429, { ok: false, message: 'Too many tries - wait a while.' });
       if (!(await checkPassword(body.password, p.pass))) return json(res, 401, { ok: false, field: 'password', message: "Your current password isn't right." });
       const bad = passwordProblem(body.newPassword, p.username);
@@ -808,7 +946,7 @@ async function route2(route, req, res, body, ip) {
       dropTokens(p);   // signs out every other device
       const token = newToken(p);
       save();
-      return json(res, 200, { ok: true, token });
+      return json(res, 200, Object.assign({ ok: true }, issued(p, token)));   // Round 111: a fresh SESSION_DAYS from now
     }
 
     case '/players/signout': {
@@ -825,8 +963,9 @@ async function route2(route, req, res, body, ip) {
     }
 
     case '/players/agree': {
-      const p = byBearer(req);
-      if (!p) return json(res, 401, { ok: false, message: 'Please sign in again.' });
+      const why = byBearerWhy(req);   // Round 111
+      const p = why.p;
+      if (!p) return json(res, 401, signinReply(why));
       p.terms = { version: TERMS_VERSION, at: now(), age13: true };
       p.updated = now();
       save();
@@ -836,8 +975,9 @@ async function route2(route, req, res, body, ip) {
     case '/players/store-link': return storeLink(req, res, body, ip);   // Round 109
 
     case '/players/delete': {
-      const p = byBearer(req);
-      if (!p) return json(res, 401, { ok: false, message: 'Please sign in again.' });
+      const why = byBearerWhy(req);   // Round 111
+      const p = why.p;
+      if (!p) return json(res, 401, signinReply(why));
       if (!(await checkPassword(body.password, p.pass))) return json(res, 401, { ok: false, field: 'password', message: "That password isn't right." });
       removeAccount(p.username.toLowerCase());
       return json(res, 200, { ok: true });
@@ -858,8 +998,9 @@ async function route2(route, req, res, body, ip) {
 const MAX_STORE_BODY = 1024;
 
 function storeLink(req, res, body, ip) {
-  const p = byBearer(req);
-  if (!p) return json(res, 401, { ok: false, message: 'Please sign in again.', required: required() });
+  const why = byBearerWhy(req);   // Round 111
+  const p = why.p;
+  if (!p) return json(res, 401, signinReply(why));
   // Round 109 (review L5): per account AND per network, like /store/account/create - and making a NEW store account this
   // way counts against the very same limit as making one in the Store (5 an hour from one network).
   if (peek('slink|' + p.uid, 10, 3600000) || peek('slinkip|' + ip, 30, 3600000)) return json(res, 429, { ok: false, message: 'Slow down a little.' });
@@ -915,8 +1056,9 @@ function isTicket(text) { return typeof text === 'string' && TICKET_RE.test(text
 
 function ticketRoute(req, res, ip) {
   if (req.method !== 'POST') { json(res, 405, { ok: false }); return; }
-  const p = byBearer(req);
-  if (!p) { json(res, 401, { ok: false, signin: true, message: 'Please sign in again.', required: required() }); return; }
+  const why = byBearerWhy(req);   // Round 111: a key that ran out gets no ticket (401 {signin, expired})
+  const p = why.p;
+  if (!p) { json(res, 401, signinReply(why)); return; }
   if (peek('ticket|' + p.uid, 60, 600000) || peek('ticketip|' + ip, 200, 600000)) { json(res, 429, { ok: false, message: 'Slow down a little.' }); return; }
   limited('ticket|' + p.uid, 60, 600000);
   limited('ticketip|' + ip, 200, 600000);
@@ -1183,9 +1325,10 @@ function gate(req, body, what) {
     if (graceActive()) return { ok: true, account: '', grace: true };   // Round 109 (review M5): an older game, in the grace period
     return { ok: false, status: 426, reply: { ok: false, update: true, message: 'Update New Moon to play online - this version of the game is too old for live accounts.' } };
   }
-  const p = check(bearer || String(body.pt || ''));
-  if (!p) return { ok: false, status: 401, reply: { ok: false, signin: true, required: true, message: `Sign in to your live account to ${what || 'play online'}.` } };
+  const why = checkWhy(bearer || String(body.pt || ''));   // Round 111: + expired
+  const p = why.p;
+  if (!p) return { ok: false, status: 401, reply: Object.assign({ ok: false, signin: true, required: true, message: why.expired ? `Your sign-in ran out (they last ${SESSION_DAYS} days) - sign in again to ${what || 'play online'}.` : `Sign in to your live account to ${what || 'play online'}.` }, why.expired ? { expired: true } : {}) };
   return { ok: true, account: p.uid, username: p.username.toLowerCase() };   // Round 109: the account's uid (worlds go by it)
 }
 
-module.exports = { handle, check, required, isReady, gate, redeemTicket, isTicket, graceActive, uidOf, flush, final, adminSection, TERMS_VERSION, vaultKeyOk, vaultOn: () => vault.on, _test: { state: () => state, cleanUsername, validEmail, passwordProblem, seal, unseal, merge, cleanSwag, unionSwag, pickProgress, cleanDevice, legacyUid } };
+module.exports = { handle, check, checkWhy, required, isReady, gate, redeemTicket, isTicket, graceActive, uidOf, flush, final, adminSection, TERMS_VERSION, SESSION_DAYS, vaultKeyOk, vaultOn: () => vault.on, _test: { state: () => state, cleanUsername, validEmail, passwordProblem, seal, unseal, merge, cleanSwag, unionSwag, pickProgress, cleanDevice, legacyUid, pruneTokens, tokenLive, SESSION_MS } };

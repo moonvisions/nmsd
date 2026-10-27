@@ -987,6 +987,28 @@ ROUND 110 - THIS TIME THE SERVER GOES FIRST (sec110: no sign-in keys or password
    and ids already in analytics.json (and its .bak) are removed the first time the new server starts. Crash reports
    have emails, sign-in keys / tickets, passwords and computer user names taken out before they're kept.
 
+ROUND 111 - SIGN-INS LAST 3 DAYS (everyone signs in again once after this update)
+ - A sign-in now lasts SESSION_DAYS days (3) from the moment the player signs in (or signs up, or changes their
+   password). It's FIXED, not "3 days since they last played": after 3 days the game asks for the password again.
+ - EVERYONE SIGNS IN AGAIN ONCE: sign-ins made before this update have no start time, so they count as run out. On
+   their next online tap, players with an account see the sign-in screen (username filled in); players without one
+   must sign up. Older copies of the game get the same "please sign in again" from their own screen - nothing breaks.
+ - To change how long a sign-in lasts: players.js, near the top: const SESSION_DAYS = 3;  (change the number, upload
+   players.js to GitHub, Render redeploys). Nothing else to set.
+ - Accounts, passwords, characters, saved games and Moon Shards are NOT affected - only the sign-in on each device.
+ - ORDER: upload the server first (players.js, README.txt), then publish game build 111. The order is safe either way
+   round (an older server simply never says when a sign-in runs out, and build 111 then uses 3 days itself).
+ - NMSD_TEST_CLOCK_OFFSET_MS is for the automated tests only - never add it in Render (Round 111: it's ignored on
+   Render anyway).
+ - DELETE LIVE_ACCOUNT_GRACE_UNTIL NOW (Render > nmsd > Environment > the row LIVE_ACCOUNT_GRACE_UNTIL > the trash
+   icon > Save Changes). While it's set, a game that sends no sign-in at all can still host / join rooms and use
+   saved worlds - that's the "older copies keep working" grace, and with build 111 everyone signs in anyway.
+   After deleting it, check https://nmsd.onrender.com/players/status shows "grace":false.
+ - Round 111 security (review sec111): sign-up tries are capped at 60 an hour per network (accounts made or not),
+   so nobody can test thousands of emails / usernames; the "too many wrong passwords" limit now works the same for
+   usernames that don't exist (it can't be used to find out who has an account); the try-counters are trimmed,
+   never wiped, when they get big.
+
 EVERY ONLINE THING NEEDS THE ACCOUNT NOW (Round 109)
  - Before: only the Open Festival asked for a live account. Now EVERYTHING online does: the Open Festival,
    hosting or joining a room with a code, Big Night rooms, live events (hosting and joining), and saved worlds
