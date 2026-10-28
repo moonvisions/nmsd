@@ -17,6 +17,7 @@ STEP 1 - PUT THESE FILES ON GITHUB
     leaderboards.js  store.js  storeverify.js  reports.js  patchbay.js  worlds.js  applications.js
     analytics.js  players.js  sellers.js  privacy.html  and vendors.json
     (Round 110: + adminauth.js  adminhub.js  adminui.js  statsdash.js  secrets.js - the admin sign-in, home, dashboard and server keys)
+    (Round 112: + devcheck.js - the game's Device check reports, /admin/devcheck. relay.js needs it at start)
     (Round 85: relay.js needs players.js and sellers.js at start - without them the server won't start)   (Round 69: storeverify.js checks Steam / Google Play / App Store purchases -
     see STORE_PURCHASES_SETUP.txt)
     (NOT the node_modules folder, and NEVER tickets.json - codes are secret)
@@ -986,6 +987,17 @@ ROUND 110 - THIS TIME THE SERVER GOES FIRST (sec110: no sign-in keys or password
  - Play stats (/admin/stats) no longer receive or keep player names or account ids - only "signed in: yes/no". Names
    and ids already in analytics.json (and its .bak) are removed the first time the new server starts. Crash reports
    have emails, sign-in keys / tickets, passwords and computer user names taken out before they're kept.
+
+ROUND 112 - DEVICE CHECK REPORTS (nothing to set up)
+ - New file devcheck.js. Upload it together with relay.js, adminui.js, adminhub.js, privacy.html, .gitignore and this
+   README - relay.js needs devcheck.js the moment it starts, so upload them in ONE commit.
+ - In the game: Settings > Game > Device check walks the game's screens by itself (about 2 minutes) and sends a report here.
+   See them at https://nmsd.onrender.com/admin/devcheck (the same admin sign-in), also linked from the admin home.
+ - Limits: 4 MB a report, 5 tries a day from one address, 20 a day in all, 2 being sent at once, the newest 40 kept.
+   Reports live in STORE_DATA_DIR/devcheck (the permanent disk) - the folder is in .gitignore, never in GitHub.
+ - No names: the game blacks out usernames, emails, character names and other players' names in the screenshots and words.
+ - LIVE_SIGNUP_REQUIRED no longer turns accounts off: from build 112 the game always needs an account for online play,
+   whatever that setting says. You can delete it from Render if it's there (it does nothing now for new builds).
 
 ROUND 111 - SIGN-INS LAST 3 DAYS (everyone signs in again once after this update)
  - A sign-in now lasts SESSION_DAYS days (3) from the moment the player signs in (or signs up, or changes their

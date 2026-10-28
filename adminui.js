@@ -111,7 +111,7 @@ svg.viz .hit:hover{fill:#ffffff0d}
 
 const PAGES = [
   ['/admin', 'Home'], ['/admin/stats', 'Stats'], ['/admin/players', 'Players'], ['/admin/store', 'Store & payments'],
-  ['/admin/applications', 'Applications'], ['/admin/sellers', 'Sellers'], ['/admin/patch', 'Patch bay']
+  ['/admin/applications', 'Applications'], ['/admin/sellers', 'Sellers'], ['/admin/patch', 'Patch bay'], ['/admin/devcheck', 'Device checks']
 ];
 
 // Round 110: THE ADMIN TOP BAR - on every signed-in admin page (payments.page() puts it in front of the page when

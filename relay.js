@@ -215,6 +215,7 @@ const applications = require('./applications');   // Round 67: artists applying 
 const analytics = require('./analytics');   // Round 71: play stats (/stats/*, /admin/stats)
 const players = require('./players');       // Round 74: live sign-up - a username and email for the Open Festival (/players/*, /admin/players)
 const sellers = require('./sellers');       // Round 85: real shops - sellers' real products at their booths (/sellers/*, /admin/sellers)
+const devcheck = require('./devcheck');     // Round 112: device check reports from the game (POST /devcheck, /admin/devcheck)
 const crypto = require('crypto');
 const eventRooms = new Map();      // Round 50: live event id -> its room code
 payments.setLiveEvents(eventRooms);
@@ -2074,6 +2075,7 @@ function handleHttp(req, res) {
   if (req.url && sellers.handle(req, res)) return;        // Round 85: real shops (/sellers/apply, /sellers/mine, /sellers/checkout, /sellers/listings, /admin/sellers)
   if (req.url && analytics.handle(req, res)) return;      // Round 71: play stats (/stats/start, /stats/beat, /stats/events, /admin/stats)
   if (req.url && players.handle(req, res)) return;        // Round 74: live sign-up (/players/signup, /players/signin, /players/me, /admin/players)
+  if (req.url && devcheck.handle(req, res)) return;       // Round 112: device check reports (POST /devcheck, /admin/devcheck)
   // Round 33: the Vendor Village list. Edit vendors.json (on GitHub) and the game picks it up.
   if (req.url && req.url.split('?')[0] === '/vendors.json') {
     fs.readFile(VENDORS_FILE, 'utf8', (err, text) => {

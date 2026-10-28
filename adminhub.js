@@ -6,6 +6,7 @@
 //   Stats      analytics.headline()            Players       players.js accounts
 //   Store      store.js sales (statsdash.js)   Applications  applications.waitingCount()
 //   Sellers    sellers.js listings             Patch bay     patchbay.js DJs and set times
+//   Device checks  devcheck.js reports (Round 112)
 
 const ui = require('./adminui');
 const auth = require('./adminauth');
@@ -20,7 +21,8 @@ const ICONS = {
   store: '<path d="M4 9h16l-1.2 10.2a1 1 0 0 1-1 .8H6.2a1 1 0 0 1-1-.8z"/><path d="M8.5 9V7a3.5 3.5 0 0 1 7 0v2"/>',
   apps: '<rect x="5" y="3.5" width="14" height="17" rx="2"/><path d="M9 8.5h6M9 12h6M9 15.5h3.5"/>',
   sellers: '<path d="M3.5 9.5 5 4.5h14l1.5 5"/><path d="M4.5 9.5V20h15V9.5"/><path d="M3.5 9.5a2.8 2.8 0 0 0 5.6 0 2.9 2.9 0 0 0 5.8 0 2.8 2.8 0 0 0 5.6 0"/><path d="M10 20v-5h4v5"/>',
-  patch: '<circle cx="12" cy="12" r="8.5"/><circle cx="12" cy="12" r="2.5"/><path d="M12 3.5v3M20.5 12h-3"/>'
+  patch: '<circle cx="12" cy="12" r="8.5"/><circle cx="12" cy="12" r="2.5"/><path d="M12 3.5v3M20.5 12h-3"/>',
+  devcheck: '<rect x="6.5" y="2.5" width="11" height="19" rx="2"/><path d="M10.5 18.5h3"/><path d="m9.5 10 2 2 3.5-4"/>'
 };
 const icon = k => `<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[k]}</svg>`;
 
@@ -73,7 +75,8 @@ function numbers() {
   const pb = safe(() => require('./patchbay')._test.state(), null);
   const djs = pb ? Object.keys(pb.djs || {}).length : 0;
   const sets = pb && Array.isArray(pb.slots) ? pb.slots.filter(s => s.state !== 'done').length : 0;
-  return { stats, dash, accounts: accounts.length, newAccounts, appsWaiting, appsAll, shopsWaiting, shopsLive, djs, sets };
+  const dc = safe(() => require('./devcheck').summary(), { count: 0, newest: '', problems: 0 });   // Round 112
+  return { stats, dash, accounts: accounts.length, newAccounts, appsWaiting, appsAll, shopsWaiting, shopsLive, djs, sets, dc };
 }
 
 /**
@@ -116,7 +119,8 @@ function render(req, res, token) {
     ['/admin/store', 'store', 'Store & payments', m ? money(m.centsRange) : '$0.00', 'sales in the last 30 days', m ? `${fmt(m.salesRange)} purchases · store ${m.open ? 'ON' : 'OFF'}${m.refunds ? ` · ${fmt(m.refunds)} refunds` : ''}` : ''],
     ['/admin/applications', 'apps', 'Applications', fmt(n.appsWaiting), 'artists waiting for you', `${fmt(n.appsAll)} applications in all`],
     ['/admin/sellers', 'sellers', 'Sellers', fmt(n.shopsWaiting), 'shops waiting for review', `${fmt(n.shopsLive)} live shops`],
-    ['/admin/patch', 'patch', 'Patch bay', fmt(n.djs), 'DJs on the roster', `${fmt(n.sets)} set${n.sets === 1 ? '' : 's'} scheduled`]
+    ['/admin/patch', 'patch', 'Patch bay', fmt(n.djs), 'DJs on the roster', `${fmt(n.sets)} set${n.sets === 1 ? '' : 's'} scheduled`],
+    ['/admin/devcheck', 'devcheck', 'Device checks', fmt(n.dc.count), 'reports from players\' devices', n.dc.newest ? `newest ${n.dc.newest.slice(0, 16).replace('T', ' ')} UTC · ${fmt(n.dc.problems)} problems` : 'Settings > Device check in the game']
   ];
   const todo = [];
   if (n.appsWaiting) todo.push(['warn', `${fmt(n.appsWaiting)} artist application${n.appsWaiting === 1 ? '' : 's'} waiting`, '/admin/applications', 'Review']);
