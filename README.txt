@@ -18,6 +18,11 @@ STEP 1 - PUT THESE FILES ON GITHUB
     analytics.js  players.js  sellers.js  privacy.html  and vendors.json
     (Round 110: + adminauth.js  adminhub.js  adminui.js  statsdash.js  secrets.js - the admin sign-in, home, dashboard and server keys)
     (Round 112: + devcheck.js - the game's Device check reports, /admin/devcheck. relay.js needs it at start)
+    (Round 115 launchC: + moderation.js  safety.js  wordfilter.js - player reports, bans and the word filter,
+     /admin/moderation. relay.js needs all three at start - without them the server won't start)
+    (Round 115 launchB: + liveops.js - live-ops switches, maintenance, the server's health, /admin/liveops. relay.js needs
+     it at start - see "LIVE OPS, CAPACITY AND MONITORING - ROUND 115 (launchB)")
+    (Round 115 accounts115: + accountstore.js - players.js needs it at start - see "ACCOUNT STORAGE - ROUND 115")
     (Round 85: relay.js needs players.js and sellers.js at start - without them the server won't start)   (Round 69: storeverify.js checks Steam / Google Play / App Store purchases -
     see STORE_PURCHASES_SETUP.txt)
     (NOT the node_modules folder, and NEVER tickets.json - codes are secret)
@@ -944,7 +949,8 @@ KEEPING ACCOUNTS FOREVER - DO AT LEAST ONE OF THESE (both is best)
     4. Open /admin/players: "GitHub backup: ON - last saved ..." appears within a minute of the first
        sign-up. A file players.backup.json appears in nmsd-data.
     How it works: a few seconds after every new account / password change / deletion, the server saves the
-    encrypted list to nmsd-data. When the server starts (after every update), it loads the newest copy
+    encrypted list to nmsd-data. (Round 115: it now goes to a BRANCH called "nmsd-accounts" in that repository - see
+    "ACCOUNT STORAGE - ROUND 115" below. The old players.backup.json file stays as it was.) When the server starts (after every update), it loads the newest copy
     (disk or GitHub) before letting anyone in. If GitHub can't be reached and there's no disk copy, the
     server says "starting up - try again" instead of starting empty - so nobody is ever asked to sign up
     again by mistake.
@@ -954,7 +960,8 @@ KEEPING ACCOUNTS FOREVER - DO AT LEAST ONE OF THESE (both is best)
 SAVED GAMES FOLLOW THE ACCOUNT (Round 75 - progress sync)
  The game now keeps a copy of each signed-in player's progress (level, missions, bag, friends, role...) on
  this server, so a player who reinstalls or changes phones gets it back by signing in. Nothing to set up:
- it's stored inside the same accounts file and GitHub backup as the account itself (A / B above keep it).
+ it's kept with the account on the disk and in the GitHub backup (A / B above keep it). (Round 115: each saved game is now
+ its own small file - see "ACCOUNT STORAGE - ROUND 115".)
  On /admin/players each row says "synced 3 min ago" and the CSV has last_sync and role columns.
  For the curious (the game does this by itself, with the player's sign-in token):
    GET  /players/progress   -> {ok:true, stamp, social, progress, role}   (stamp 0 and "" until the first sync)
@@ -1174,3 +1181,300 @@ Optional settings (Render > Environment; leave them out for the normal values):
    LIVE_KINDS         which moments and in what order, e.g. crowd,drop,crew,fireworks
    RESUME_GRACE_MS    how long a dropped player's place is kept (20000)
    RELAY_DEFLATE      1 = compress big messages for web-browser players (uses more memory; off by default)
+
+
+PLAYER SAFETY AND MODERATION - ROUND 115 (launchC)
+Upload these with the new relay.js / players.js:  moderation.js  safety.js  wordfilter.js  (relay.js needs them to start).
+What it does (nothing to set up):
+ - REPORTS. In the game a player can report someone from their card (walk up to them > More > Report them), from
+   Settings > Online > People here, from a chat line (RECENT CHAT > Report), from a booth's card or the spray-paint
+   screen. They pick why (harassment, hate, sexual content, cheating, under 13, something else), what it's about and
+   can add a short note. Your page shows each report with who reported, the room, the time and the reported player's
+   last chat lines there.
+ - YOUR PAGE: https://YOUR-SERVER.onrender.com/admin/moderation (the same admin sign-in). For each reported player:
+     Warn          a message they see at once (or the next time they go online)
+     Mute          for 1 hour to 1 week: the server drops their chat, open-mic lines and voice
+     Ban           1 day to 30 days, or for good: they can't get into any room or the Open Festival (taken out at once)
+     Delete their content   their saved worlds go, and their spray paint and booth are cleared for everyone online
+     Mark reviewed closes the reports
+   "Look up a player" finds any account by username. Everything you do is in the Action log at the bottom.
+ - UNDER 13. One "under 13" report pauses that account's online play straight away (they can still play on their own)
+   until you look: "Under 13: clear" if they're 13 or older, "Under 13: confirm" bans them for good - then delete the
+   account on the Players page. The admin home's "Needs you" list tells you when one is waiting.
+ - THE WORD FILTER. Chat, open-mic lines, usernames, room titles and shirt prints go through one list on the server:
+   mild swearing is shown starred out (f***); slurs and sexual words are never shown, and the sender appears on your
+   page as an automatic report. To add words without putting them on GitHub (the repository is public): Render >
+   your service > Environment > Secret Files > Add Secret File, Filename: wordfilter.json, Contents:
+     { "severe": ["word1", "word2"], "mild": ["word3"], "allow": ["everyday-word-that-was-caught"] }
+   It's read within 5 minutes.
+ - BLOCKS are saved on the player's account, so they hold on every device, and a blocked player can't join a room
+   hosted by the person who blocked them.
+ - Kept where: the actions on an account are kept on the account itself (players.json and its backup); reports and the
+   action log in moderation.json on the disk (STORE_DATA_DIR). moderation.json is in .gitignore - never upload it.
+Optional settings (Render > Environment):
+   U13_REPORTS_TO_PAUSE   how many different players' "under 13" reports pause an account (1)
+   MODERATION_FILE        where reports and the log are kept (default: moderation.json in STORE_DATA_DIR)
+   WORDFILTER_EXTRA       the same as the wordfilter.json secret file, as one line of text
+
+
+==========================================================================================================
+LIVE OPS, CAPACITY AND MONITORING - ROUND 115 (launchB)
+==========================================================================================================
+What's new: a LIVE OPS page for running the live game (announcement, maintenance mode, minimum build, feature switches,
+the Open Festival's player cap), a meaningful /healthz for uptime alerts, crash logging, tighter abuse limits, and a much
+lighter Open Festival (it sends far less data when it's busy - that's money, see "WHAT IT COSTS" below).
+
+UPDATE YOUR SERVER (about 5 minutes) - do it BEFORE you publish game build 115
+ 1. Go to github.com and open your nmsd repository. Click "Add file" > "Upload files".
+ 2. Drag in these files from this folder, all in ONE upload (relay.js needs liveops.js the moment it starts):
+       liveops.js (NEW)   relay.js   adminhub.js   adminui.js   .gitignore   README.txt
+    (and the other Round 115 files from the other changes this round, if you haven't uploaded them yet)
+ 3. Click the green "Commit changes" button. Render redeploys by itself in a minute or two.
+ 4. Check it: open https://nmsd.onrender.com/healthz in your browser. It should start with "ok" and then a line like
+    {"status":"ok","players":0,...}.
+ 5. Then publish game build 115 the usual way. Older games (112-114) keep working with this server.
+ Nothing to set on Render. Everything below is optional.
+
+YOUR LIVE OPS PAGE
+ https://nmsd.onrender.com/admin/liveops  (or: Admin home > the "Live ops" tile, the first one; or "Live ops" in the top bar)
+ Same admin password and sign-in as every admin page. Every change works straight away - no redeploy - and is saved on the
+ permanent disk (and in your private GitHub backup, if you set that up). "Recent changes" at the bottom lists what changed when.
+
+ - SERVER RIGHT NOW (top card, refreshes every 10 s): players in the Open Festival / the cap, rooms open, memory, event-loop
+   lag, CPU, errors in the last hour, who was turned away and why, and which game builds are online.
+ - MAINTENANCE MODE (the big button): nobody NEW can get into the Open Festival, friends' rooms or live events - they're told
+   your message. Everyone already playing carries on until they leave, and someone whose connection drops for a moment gets
+   back in. Use it before a big server update:
+     1. Write a message in "Maintenance message", e.g. "Back at 3 pm - new stage going up!", press Save changes.
+     2. Press "Turn maintenance ON". Wait until "in the Open Festival" is low (or 15 minutes).
+     3. Upload your server update to GitHub. Render restarts the server (players get "restarting" and reconnect by themselves).
+     4. Sign in to /admin/liveops again and press "Turn maintenance OFF". (Maintenance stays ON over the restart - it's saved.)
+ - ANNOUNCEMENT: one short line (160 characters; under about 80 reads best on a phone). The game shows it on the title screen
+   (in the JOIN LIVE door, where it says who's there) and once as a notice when a player arrives in the Open Festival, and
+   again when you change it. "Important" shows it in the warning colour. Empty = none. Build 115 and newer only (older games
+   simply don't show it). Only plain letters, numbers, accents and ordinary punctuation are kept - no emoji.
+ - MINIMUM SUPPORTED BUILD: games older than this number are told "Update New Moon to play online" when they try to join or
+   host. 0 = off. Works for every build (old games show the server's words). Build 115+ also offer the update right there.
+   ONLY raise it after the new build is out everywhere (GitHub release, Google Play, Steam) - check the Stats page's versions
+   and "Games online" on this page first. Never set it above the newest build you've published, or nobody can play online.
+ - FEATURE SWITCHES: untick one and press Save changes - it's off for everyone at once:
+     Voice chat (and the open mic) - the server stops passing any voice on.
+     Text chat - the server stops passing chat on.
+     Player-made content - spray paint, booth designs, showcases and "Send to community" creations stop.
+     The Open Festival / Friends' rooms / Live events - nobody new gets in (players inside carry on).
+     Device check - reports are refused.
+   The server enforces all of these for every game version; Build 115+ also grey them out with a short message.
+ - OPEN FESTIVAL PLAYER CAP (2-500): over it, players are told "The Open Festival is full right now - try again in a few
+   minutes." Starts at 100 (or PUBLIC_CAPACITY if you set that on Render). See the capacity table below for what to set.
+
+LAUNCH CAPACITY (load-tested, Round 115)
+ How it was tested: /home/claude/work/launch/loadtest (run.js) plays realistic players against a copy of this server - sign-up,
+ tickets, the Open Festival (steps at the game's real rates: 10 a second walking, 2 a second standing; quick chat now and then;
+ voice to the people within 25 m while talking), friends' rooms of 6 (the host's 60 KB festival save to each guest), play stats
+ and progress sync, people leaving and coming back all the time - at 25, 50, 100, 200 and 400 players (3 in 4 in the Open
+ Festival), then 200 new sign-ups in one minute on top. The server ran on ONE CPU core of the test machine.
+
+   Players online   | Data to each Open Festival player (KB a second)       | Server  | Memory | Event-loop
+   (3 in 4 in the   | Round 114 server | Round 115:      | Round 115:       | CPU (of | (RSS)  | lag, p99
+   Open Festival)   | (before)         | builds 112-114  | build 115        | 1 core) |        | (max)
+   -----------------+------------------+-----------------+------------------+---------+--------+-----------
+        25          |   9              |   8             |   3.5            |   3-4%  | 160 MB | 1 ms
+        50          |  16              |  10             |   6              |   4-5%  | 170 MB | 2 ms
+       100          |  29              |  21             |  10              |   7-8%  | 190 MB | 3 ms
+       200          |  55              |  35             |  19              |  14-16% | 205 MB | 4-7 ms (32)
+       400          |  80 (only 245    |  62             |  33              |  32-36% | 230 MB | 32-44 ms (152)
+                    |  got in: old cap)|                 |                  | peak 50%|        |
+   600 (400 + 200   |   -              |  78             |  43              |  62-67% | 385 MB | 160-260 ms (500)
+   sign-ups in 1 min)|                 |                 |                  | peak 81%|        |
+   All the server sends, at 200 players: 8.6 MB/s before -> 5.8 MB/s (builds 112-114) -> 3.4 MB/s (build 115).
+   At 400: 20 MB/s (with only 245 in the Open Festival) -> 19 MB/s (297 in) -> 10.5 MB/s.
+   A player in a friends' room gets about 10-12 KB/s whatever the server's size.
+   The 200 sign-ups in one minute: all made it in; sign-up took 0.3-0.4 s typically, 1 s for the slowest 5%, 3.3 s at worst.
+
+WHAT BREAKS FIRST
+ 1. BANDWIDTH (your bill), long before anything else. Render's workspace plans include only 5 GB a month (Hobby) or 25 GB (Pro)
+    of outbound data; every GB after that is $0.15. At Build 115's rates that's roughly 20-70 MB per player per hour in the Open
+    Festival (more the busier it is): e.g. 50 players online all day, every day = about 750 GB a month = about $110 a month; 100
+    online all the time = about 2.7 TB = about $400. Older builds cost about twice that, the Round 114 server about three times.
+    Watch it daily at first (Render > Billing / the service's Metrics). The Scale plan ($499 a month) includes 1 TB.
+ 2. CPU. The Starter plan has half a CPU. On the test machine 400 players used about a third of one core on average (peaks to a half),
+    600 about two thirds. Half a CPU is therefore full at roughly 350-400 players - and Render's CPUs may be slower than the test
+    machine's, so count on 250-300 on Starter. Past that, lag grows (the burst to 600 reached 0.5 s spikes on a full core).
+ 3. Memory is fine: 400 players used 230 MB of the 512, 600 about 385 MB (75% - "busy"). (Round 115 accounts115 - FIXED: the
+    accounts used to grow without limit - every saved game in memory and the whole file rewritten every few seconds, a 0.5 s
+    freeze at 5,000 accounts and out of memory at 10,000. Saved games are now in their own files: 50,000 accounts use about
+    60-105 MB of memory and no save holds the server up for more than about 20 ms. See "ACCOUNT STORAGE - ROUND 115".)
+ The server never fell over in the tests: at the cap players are told it's full, slow connections are let go (their game
+ reconnects), and above 88% memory or 1 s of lag new players are told "the festival is very busy - try again in a few minutes"
+ while everyone inside carries on.
+
+RECOMMENDATION (what to buy, when to change)
+ - LAUNCH ON STARTER ($7/month, 512 MB, half a CPU) with the Open Festival cap at 100 (the default). It's comfortable up to
+   about 150 players online in all; the hard ceiling is about 250-300.
+ - MOVE TO STANDARD ($25/month, 2 GB, 1 CPU) when the Live ops page often shows more than 150 players online, says "busy", or
+   lag stays above 100 ms - then the cap can go to 250. (Render > nmsd > Settings > Instance Type > Standard > Save. Takes a
+   minute; players reconnect by themselves.) One server holds everyone - the game isn't built for several servers at once, so
+   bigger means a bigger instance, not more of them.
+ - THE BILL TO WATCH IS BANDWIDTH, not the instance. Ask players to update to Build 115 (it uses half the data), and once
+   nearly everyone has it, set the minimum build to 115. If the bill climbs, lowering the Open Festival cap is the quickest
+   brake (a smaller crowd sends much less to each player).
+ - Disk: keep the Render disk (1 GB is plenty for now) - "Persistent disk usage above 80%" emails you before it fills.
+
+WHAT TO WATCH (Live ops page, top card; or https://nmsd.onrender.com/healthz)
+ - Memory over 75% of the limit, or lag over 250 ms: the page says "busy". Lower the cap a little, or plan the next plan up.
+ - "overloaded" (88% memory or 1 s lag): new players are being turned away automatically. Lower the cap now.
+ - Errors in the last hour going up: open Render > nmsd > Logs and look for lines starting [uncaught] - send them to your
+   developer.
+ - Bandwidth: Render > your workspace > Billing (or the service's Metrics > Bandwidth) - check it every day the first week.
+
+SET UP FREE ALERTS (about 10 minutes, do this once)
+ A. Render's own health check (Render restarts the server if it ever stops answering, and won't switch to a new deploy
+    that doesn't answer):
+    1. render.com > your service "nmsd" > Settings > scroll down to "Health Checks" > Edit.
+    2. Type  /healthz  and press Save Changes.
+    (It only fails if the server stops answering within 5 seconds - being busy never fails it, so a busy server isn't restarted.)
+ B. Render's emails:
+    1. render.com > your workspace home > "Integrations" (left side) > "Notifications".
+    2. Make sure Email is on for: "Deploy or build failure", "Unhealthy running service" and "Persistent disk usage above
+       80%" (the disk keeps accounts, worlds and stats - if it fills, add space: Render > nmsd > Disks).
+ C. UptimeRobot (free - a text-message-style alert to your phone and an email when the server is down or overloaded):
+    1. Go to uptimerobot.com and sign up (free plan). Install the UptimeRobot app on your Android phone and sign in, so you
+       get push alerts.
+    2. Click "+ New monitor" (or "Add New Monitor").
+    3. Monitor type: HTTP(s). Friendly name: New Moon server.
+    4. URL:  https://nmsd.onrender.com/healthz?alert=1
+       (This address answers "ok" when all is well and an error (503) when the server is overloaded or keeps hitting
+       errors - so you hear about trouble, not just about it being off.)
+    5. Monitoring interval: 5 minutes. Alert contacts: tick your email (and the app).
+    6. Press "Create monitor". It should say "Up" within 5 minutes.
+    7. Test it once: edit the monitor and change the URL to https://nmsd.onrender.com/nothing-here - within 5 minutes it
+       goes "Down" and you get the alert. Change the URL back. (Maintenance mode does NOT count as down.)
+ D. When you get a "down" alert: open https://nmsd.onrender.com/healthz. Nothing at all = the server is down: open Render >
+    nmsd > Logs (the last lines say why) and Events; "Manual Deploy" > "Deploy latest commit" restarts it. "overloaded" = too
+    many players: lower the cap on the Live ops page (players inside are never thrown out).
+
+CRASHES AND RESTARTS
+ - Every uncaught error is written to Render's Logs with where it happened (lines starting [uncaught] or [unhandled
+   rejection]), counted on the Live ops page, and the server keeps running. More than 10 in one minute and it saves everything
+   and restarts cleanly (Render starts a fresh copy by itself within seconds - that's Render's "supervisor").
+ - What survives a restart (it's on the permanent disk, STORE_DATA_DIR): accounts and saved games (and the GitHub backup),
+   Moon Shards, saved worlds, play stats, leaderboards, the patch bay, reports and moderation, and these live-ops settings.
+   What doesn't need to: rooms and the Open Festival - games reconnect by themselves (the Open Festival is told "restarting").
+
+ABUSE LIMITS (all automatic)
+ - Chat: 1 line a second per player (a burst of 5); far over it (25 dropped in a minute) the player is disconnected.
+ - Steps: 14 a second per player (games send at most 10). Every player message is size- and rate-limited (80 a second);
+   a flood disconnects.
+ - Hosts: 400 lines a second (or 25 per player in the room) - a flooding host's room is closed. (Hosts had no limit before.)
+ - Rooms: one network can open 12 rooms in 10 minutes (and keep 4 open); 120 rooms a minute in all.
+ - Connections: 120 new connections a minute and 40 open at once from one network; 1,200 open in all.
+ - Sign-ups / sign-ins: unchanged (players.js: 20 new accounts and 60 tries an hour per network, wrong-password limits).
+ - HTTP: /config 120 a minute per network; /public, /schedule, /metrics 60; /rooms 30; the vendor feed is cached.
+ - Slow connections: an Open Festival player more than 1 MB behind, a room guest 2 MB, a host 4 MB is let go (they reconnect);
+   everything waiting to go out is kept under 96 MB in all.
+
+OPTIONAL SETTINGS (Render > nmsd > Environment) - you don't need any of these
+   PUBLIC_CAPACITY        where the Open Festival cap starts (100) - the Live ops page's number wins once you save it there
+   MEMORY_LIMIT_MB        the server's memory, if the page shows the wrong limit (normally it reads it itself; 512 on Starter)
+   MAX_SOCKETS_TOTAL      connections at once, everyone together (1200)
+   CONNECTS_PER_MINUTE    new connections a minute from one network (120)
+   ROOMS_PER_10_MIN       rooms one network may open in 10 minutes (12);  ROOMS_PER_MINUTE_ALL (120)
+   OUT_BUDGET_MB          all the data waiting to go out at once (96)
+
+FOR THE CURIOUS (what the game reads)
+   GET /config?b=<build>  {ok, rev, motd:{text,level}, maintenance:{on,text}, minBuild, updateText, switches:{voice, chat, ugc,
+                          openFestival, rooms, liveEvents, deviceCheck}, publicCap, update:{required}}. Build 115 reads it at
+                          launch and every 10 minutes, keeps the last good copy, and if it can't reach the server (or the copy
+                          is older than 30 minutes) it fails OPEN - everything on.
+   {"relay":"cfg"}        the Open Festival tells Build 115 games a setting changed (they read /config again at once).
+   Compact steps          Build 115 games say cap 16: the Open Festival sends their steps without the unchanged look (outfit,
+                          name, role) - about half the data. Older games get every step in full, exactly as before.
+
+
+==========================================================================================================
+ACCOUNT STORAGE - ROUND 115 (accounts115) - accounts that stay fast at 50,000+ players
+==========================================================================================================
+WHY: the launch load test found that the server kept EVERY player's saved game in memory and wrote the whole accounts file
+again every few seconds. At 5,000 accounts every save froze the whole game server for half a second (everyone online felt it);
+at 10,000 it ran out of memory on the Starter plan. That's fixed: each player's saved game now lives in its own small file,
+and the server only keeps a small list of the accounts in memory.
+
+  Measured (16 KB of saved game per account):   memory used       longest freeze when saving
+     5,000 accounts  before:  330 MB, 0.36 s per save   ->   after:  about 80 MB, under 3 ms
+    10,000 accounts  before:  550 MB (too big for 512)  ->   after:  about 100 MB, under 3 ms
+    50,000 accounts  before:  impossible                ->   after:  about 170-225 MB, under 20 ms
+
+Nothing changes for players: same sign-in, same 3-day sign-in keys, same saved games, same everything.
+
+WHAT'S ON THE DISK NOW (STORE_DATA_DIR, e.g. /var/data) - you never need to touch these
+   players.json          the list of accounts (no saved games inside any more - much smaller)
+   players.journal.N     the latest changes (folded into players.json every few minutes)
+   players/              one folder per two letters, with each player's saved game in its own file
+   players.pre115.json   a copy of your ORIGINAL players.json from before this update - keep it until you're happy
+   players-vault.json    notes for the GitHub backup (what it has already sent)
+
+UPDATE YOUR SERVER (about 5 minutes) - do it at a quiet time if you can
+ 1. Go to github.com and open your nmsd repository. Click "Add file" > "Upload files".
+ 2. Drag in these files, all in ONE upload:  accountstore.js (NEW)   players.js   .gitignore   README.txt
+    (players.js needs accountstore.js the moment it starts - upload both together.)
+ 3. Click the green "Commit changes" button. Render redeploys by itself in a minute or two.
+
+WHAT HAPPENS ON THE FIRST START (the one-time move - "migration")
+ - The server copies your players.json to players.pre115.json (your safety copy), then moves every saved game into its own
+   file, reads every file back to check it, compares the counts, and only then switches to the new layout.
+ - HOW LONG: about 1-2 seconds per 1,000 accounts on the test machine. Allow up to a minute on Render for a few thousand
+   accounts. While it runs, the game shows "The server is starting up - try again in a few seconds" for accounts - that's
+   normal. Rooms and the Open Festival come back as soon as it's done.
+ - If Render restarts the server in the middle, nothing is lost: your original file isn't touched until the very end, and the
+   next start carries on where it stopped. Running it twice is harmless.
+ WHAT TO WATCH:
+ 1. Render > nmsd > Logs. Look for a line like:
+       players: MIGRATION DONE in 2.1 s - 1834 accounts (1834 now), 1650 saved games moved to their own files, 1650 checked.
+    The two account numbers should be the same. Then:  players: 1834 live accounts loaded (disk)
+ 2. Open https://nmsd.onrender.com/admin/players - the account count should be the same as before, and near the top it says
+    "Accounts moved to the new storage on ...".
+ 3. Sign in on your own phone and check your character and progress are there.
+ If you see "MIGRATION COUNT CHECK" or "didn't check out" in the logs, don't panic - nothing was deleted. Send the log lines to
+ your developer, and use the rollback below if you want to be extra safe.
+
+THE GITHUB BACKUP (if you set it up) now goes to a branch called "nmsd-accounts" in your private nmsd-data repository
+ - On github.com, open nmsd-data, click the button that says "main" (top left of the file list) and pick "nmsd-accounts". You'll
+   see index.enc (the accounts), a "saves" folder (the saved games, in 256 packs) and manifest.json (how many accounts, when).
+   Everything is encrypted with your BACKUP_KEY exactly like before.
+ - Only the parts that changed are sent, so it stays quick. With many accounts it sends less often (every few minutes at
+   50,000 accounts) - the disk always has the latest.
+ - It keeps its last 24 copies and then starts again from one, so the repository stays small.
+ - The old players.backup.json on the "main" branch is read once on the first start and then left alone (it's your copy from
+   before this update). Don't delete it for now.
+ - The admin "Players" page says "GitHub backup: ON (..., branch nmsd-accounts) - last saved ...". If it says "N saved-game
+   packs still to send", it's catching up - that's fine.
+ - Optional: BACKUP_GITHUB_BRANCH on Render changes the branch name (normally leave it).
+ - "Download full backup" on the admin page still works and still gives ONE file with every account and saved game (it's built
+   on the fly now, so a very big one takes a little while to download). Keep one somewhere safe now and then, as before.
+
+ROLLBACK - GOING BACK TO THE OLD players.js (only if something is really wrong)
+ Don't just upload the old players.js: it can't read the new layout and players would miss their saved games. Do this instead:
+ 1. Render > nmsd > Environment > "Add Environment Variable":   Key: ACCOUNTS_ROLLBACK   Value: 1   > "Save Changes".
+ 2. Wait for the restart (about 2 minutes). Render > nmsd > Logs shows:
+       players: ROLLBACK READY: players.json is in the OLD format again (every account with its saved game). ...
+    From now on the game says "starting up" for accounts until step 3 is done (rooms keep working).
+ 3. Put the old players.js back on GitHub (or ask your developer to do this step):
+    a. github.com > your nmsd repository > click players.js > click "History" (top right of the file, a clock icon).
+    b. In the list, find the newest commit from BEFORE you uploaded the Round 115 files, and click its "<>" button
+       ("Browse the repository at this point"). Click players.js there, then the "Raw" button.
+    c. Select everything on that page (Ctrl+A) and copy it (Ctrl+C).
+    d. Go back to your repository's main page > players.js > the pencil (Edit) > select everything > paste (Ctrl+V) >
+       "Commit changes". Render redeploys by itself. (accountstore.js can stay - the old players.js simply doesn't use it.)
+ 4. When Render has redeployed: Render > nmsd > Environment > delete ACCOUNTS_ROLLBACK > Save Changes.
+ 5. Check /admin/players: the same accounts as before. The new-layout files stay on the disk (players/ and players.split.json)
+    and do no harm; if you later upload the new players.js again, it moves everything across again by itself.
+ Last-resort copy: players.pre115.json on the disk is your original file exactly as it was before the update (Render > nmsd >
+ Shell: ls -l /var/data shows it).
+
+FOR THE CURIOUS
+   ACCOUNT_CACHE_MB      how much memory recently played saved games may use (24 MB; 4-256). Normally leave it.
+   Deleting an account removes its saved-game file within a second, and its pack in the GitHub backup is sent again without it.
+   Tests: r115acct.test.js (migration of 2,000 accounts, a crash halfway and the restart, deletion, backup / restore, the GitHub
+   backup, a burst of 500 sign-ups, 50,000 accounts). The load test: /home/claude/work/launch/loadtest/accounts-growth.js
+   (before) and accounts-growth.js 16 --after <server folder> (after).
+

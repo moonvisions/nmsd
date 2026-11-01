@@ -64,7 +64,21 @@ const EVENTS = new Set(['festival_start', 'festival_end', 'festival_leave', 'tie
   'open_join', 'open_leave', 'mp_host', 'mp_join', 'activity', 'photo', 'purchase', 'error', 'quit', 'signup', 'guide',
   // Round 110: the feature events (Net/AnalyticsHooks.cs) - see the top of this file
   'career_tier', 'career_complete', 'land_plot', 'stage_upgrade', 'module_fit', 'green_build', 'mx_race', 'pyro_show', 'emote',
-  'swag_unlock', 'speedway', 'update_download', 'update_install', 'update_fail', 'signin_ok', 'signin_fail', 'build']);
+  'swag_unlock', 'speedway', 'update_download', 'update_install', 'update_fail', 'signin_ok', 'signin_fail', 'build',
+  // Round 115 (launchC): the first-session funnel (Net/Funnel.cs) - each counted once per install (p.fn: step -> when), session_end
+  // with the session's length in seconds (a.sec). No names, no account ids: only which step, which title door, how long.
+  'first_launch', 'title_door', 'first_activity', 'signup_view', 'signup_done', 'character_done', 'live_join', 'first_job_done',
+  'career_start', 'first_festival_done', 'session_end']);
+/** Round 115 (launchC): the funnel's steps in order, the three ways in (title doors), and session-length buckets (seconds). */
+const FUNNEL_STEPS = [
+  ['first_launch', 'Opened the game for the first time'], ['title_door', 'Tapped a door on the title'],
+  ['demo_start', 'Demo: started'], ['first_activity', 'Demo: first activity'],
+  ['signup_view', 'Live: saw the sign-up'], ['signup_done', 'Live: made an account'], ['character_done', 'Live: made their character'],
+  ['live_join', 'Live: in the Open Festival'], ['first_job_done', 'Live: finished a first role job'],
+  ['career_start', 'Career: started a first festival'], ['first_festival_done', 'Career: finished a first festival']
+];
+const DOORS = ['demo', 'live', 'career'];
+const SESSION_BUCKETS = [60, 180, 600, 1800, 3600];   // under 1 min, 1-3, 3-10, 10-30, 30-60, 60+
 /** Round 110: the career's ranks, in order (CareerRank in Data/CareerExpansion.cs). */
 const CAREER_RANKS = ['renegade', 'local', 'regional', 'major', 'mega', 'headlinerempire', 'global', 'legend'];
 const FUNNEL = [
@@ -120,6 +134,7 @@ function repair() {
   state.fest.grades = dict(state.fest.grades);
   for (const k in state.acts) if (typeof state.acts[k] !== 'number') delete state.acts[k];
   state.fx = numbers(state.fx);   // Round 110 (a v1 file has none: it starts empty)
+  if (state.se && (typeof state.se !== 'object' || !Array.isArray(state.se.b) || !Number.isFinite(state.se.n) || !Number.isFinite(state.se.sec))) delete state.se;   // Round 115 (launchC)
   state.v = 2;
   for (const e of Object.values(state.errors)) { e.v = dict(e.v); e.pl = dict(e.pl); }
   for (const d of Object.values(state.days)) {
@@ -135,6 +150,7 @@ function repair() {
   if (typeof state.salt !== 'string' || !/^[0-9a-f]{32}$/.test(state.salt)) state.salt = crypto.randomBytes(16).toString('hex');
   for (const p of Object.values(state.installs)) {
     p.fl = dict(p.fl); if (p.ers) p.ers = dict(p.ers); if (!Array.isArray(p.ad)) p.ad = [];
+    if (p.fn) p.fn = numbers(p.fn);   // Round 115 (launchC): funnel steps (step -> when)
     // Round 110 (sec110 M6): no player names and no account ids in the stats - names from older files are dropped, ids
     // become the salted tag (the dashboard only needs "signed in", and to recognise a build-109 account).
     if (p.n !== undefined) { delete p.n; scrubbed = true; }
@@ -431,7 +447,7 @@ function onEvents(b, now) {
         f.grades[g] = (f.grades[g] || 0) + 1;
         break;
       }
-      case 'demo_start': p.fl.demo = 1; break;
+      case 'demo_start': p.fl.demo = 1; funnelStep(p, name, a, now); break;   // Round 115 (launchC): + the funnel
       case 'walk': p.fl.walk = 1; break;
       case 'open_join': case 'mp_host': case 'mp_join': p.fl.social = 1; break;
       case 'tier': if (a.title) p.t = str(a.title, 30); break;
@@ -465,12 +481,51 @@ function onEvents(b, now) {
         break;
       }
       case 'quit': live.delete(b.sid); break;
+      // Round 115 (launchC): the first-session funnel
+      case 'first_launch': case 'title_door': case 'first_activity': case 'signup_view': case 'signup_done': case 'character_done':
+      case 'live_join': case 'first_job_done': case 'career_start': case 'first_festival_done':
+        funnelStep(p, name, a, now);
+        break;
+      case 'session_end': {
+        // (a phone sends this each time it goes to the background: the same session again replaces its length, never counts twice)
+        const sec = Math.round(num(a.sec, 0, 86400));
+        if (sec <= 0) break;
+        const sid = String(b.sid).slice(0, 8);
+        const se = state.se || (state.se = { n: 0, sec: 0, b: [0, 0, 0, 0, 0, 0] });
+        const bucket = x => { let i = 0; while (i < SESSION_BUCKETS.length && x >= SESSION_BUCKETS[i]) i++; return i; };
+        d.se = d.se || { n: 0, sec: 0 };
+        if (p.lsid === sid && p.lsec > 0) {
+          se.sec += sec - p.lsec;
+          se.b[bucket(p.lsec)] = Math.max(0, (se.b[bucket(p.lsec)] || 0) - 1);
+          se.b[bucket(sec)] = (se.b[bucket(sec)] || 0) + 1;
+          d.se.sec += sec - p.lsec;
+        } else {
+          se.n++; se.sec += sec;
+          se.b[bucket(sec)] = (se.b[bucket(sec)] || 0) + 1;
+          d.se.n++; d.se.sec += sec;
+        }
+        p.lsid = sid;
+        p.lsec = sec;
+        if (!p.fn || !p.fn.session_end) { p.fn = p.fn || dict(); p.fn.session_end = now; p.fs1 = sec; p.fs1s = sid; }   // (the first session's length)
+        else if (p.fs1s === sid) p.fs1 = sec;
+        break;
+      }
       default:
         if (name !== 'other') feature(name, a, p, d);   // Round 110
         break;
     }
   }
   save();
+}
+
+/** Round 115 (launchC): one funnel step for this install - only the first time counts (when, in ms). */
+function funnelStep(p, name, a, now) {
+  if (!p.fn) p.fn = dict();
+  if (!p.fn[name]) p.fn[name] = now;
+  if (name === 'title_door') {
+    const door = word(a.door, 10);
+    if (DOORS.includes(door) && !p.fn['door_' + door]) p.fn['door_' + door] = now;
+  }
 }
 
 /**
@@ -619,7 +674,8 @@ function safe(fn) { try { return fn(); } catch { return null; } }
 
 /** Round 110: what the dashboard reads (statsdash.js) - read-only views of the state above. */
 function view() {
-  return { state, live, rev, ONLINE_MS, PERSISTENT, loadNote, relay: relay && typeof relay.live === 'function' ? safe(relay.live) : null, online: onlineNow(), CAREER_RANKS, FUNNEL };
+  return { state, live, rev, ONLINE_MS, PERSISTENT, loadNote, relay: relay && typeof relay.live === 'function' ? safe(relay.live) : null, online: onlineNow(), CAREER_RANKS, FUNNEL,
+    FUNNEL_STEPS, DOORS, SESSION_BUCKETS };   // Round 115 (launchC)
 }
 
 /** For the admin home (adminhub.js): the headline numbers. */

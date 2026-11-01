@@ -236,6 +236,22 @@ function listingOf(p) {
   return l;
 }
 
+/**
+ * Round 115 (launchA): the live account was DELETED (players.js removeAccount): its shop listing goes too - the shop, its
+ * products and the account's email. (Payment records - Stripe session ids and amounts, by the old username - stay for the
+ * accounts; they hold no email.) -> how many listings were removed.
+ */
+function removeForAccount(p) {
+  if (!p || !p.username) return 0;
+  const mine = listingOf(p);
+  if (!mine) return 0;
+  const before = state.listings.length;
+  state.listings = state.listings.filter(l => l !== mine);
+  const n = before - state.listings.length;
+  if (n) save();
+  return n;
+}
+
 function statusOf(l, t) {
   t = t || Date.now();
   if (l.state === 'declined') return 'declined';
@@ -750,5 +766,6 @@ ${form('<input type="hidden" name="action" value="delete"><button type="submit" 
 
 module.exports = {
   handle, adminSection, flush, KINDS,
+  removeForAccount,   // Round 115 (launchA): account deletion (players.js)
   _test: { state: () => state, reset: () => { state = blank(); hits.clear(); publicCache = null; }, readFields, submit, statusOf, adminAction, cleanImage, cleanLink, markPaid, publicListings }
 };

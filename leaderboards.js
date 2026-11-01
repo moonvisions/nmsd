@@ -212,6 +212,7 @@ function cleanName(name) {
 
 /** True if a bit of text has a blocked word in it (look-alike digits and spacing don't hide one). */
 function isRude(text) {
+  try { if (require('./wordfilter').nameBad(text)) return true; } catch { /* the list below still runs */ }   // Round 115 (launchC): the server's one word list
   let flat = String(text).toLowerCase()
     .replace(/0/g, 'o').replace(/1/g, 'i').replace(/3/g, 'e').replace(/4/g, 'a').replace(/5/g, 's').replace(/7/g, 't').replace(/\$/g, 's').replace(/@/g, 'a')
     .replace(/[^\p{L}]/gu, '');

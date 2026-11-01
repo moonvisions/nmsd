@@ -261,6 +261,7 @@ const BAD_STEMS = ['fuck', 'shit', 'cunt', 'bitch', 'whore', 'slut', 'nigg', 'fa
 const LEET = { '0': 'o', '1': 'i', '3': 'e', '4': 'a', '5': 's', '7': 't', '@': 'a', '$': 's', '!': 'i' };
 
 function rude(text) {
+  try { if (require('./wordfilter').nameBad(text)) return true; } catch { /* the list below still runs */ }   // Round 115 (launchC): the server's one word list
   const lower = String(text || '').toLowerCase().replace(/[013457@$!]/g, c => LEET[c]);
   const words = lower.split(/[^a-z0-9]+/).filter(Boolean);
   const joined = words.join('');
@@ -496,6 +497,34 @@ function unlinkLive(liveUid, id) {
   if (!a || a.liveUid !== String(liveUid || '') || !liveLinkable()) return false;
   transact(() => { a.liveUid = ''; });
   return true;
+}
+
+/**
+ * Round 115 (launchA): a live account was DELETED (players.js removeAccount - in the game, on the /account/delete web page or by
+ * the admin). Its store accounts (the linked one and any others seen with it) stop belonging to it, and the person's name and
+ * email are taken off them. What was bought stays on the store account (purchase records), now with no name or email - the
+ * device that holds that store account's sign-in can still use it. -> how many store accounts were changed.
+ */
+function forgetLive(liveUid, ids, email) {
+  const uid = String(liveUid || '');
+  const mail = String(email || '').trim().toLowerCase();
+  let n = 0;
+  if (!uid || !Array.isArray(ids)) return 0;
+  transact(() => {
+    for (const id of new Set(ids.map(x => String(x || '')).filter(Boolean))) {
+      const a = own(state.accounts, id);
+      if (!a) continue;
+      const mine = a.liveUid === uid;
+      const sameMail = !!mail && String(a.email || '').toLowerCase() === mail;
+      if (!mine && !sameMail) continue;   // (someone else's now - left alone)
+      if (mine) a.liveUid = '';
+      a.email = '';
+      a.name = 'Player';
+      a.forgotten = new Date().toISOString();
+      n++;
+    }
+  });
+  return n;
 }
 
 // ============================================================================ the catalog
@@ -2433,6 +2462,7 @@ function stats() {
 module.exports = {
   handle, adminSection, adminAction, mergeIntoFeed, backup, catalog, CURRENCY,
   linkLive, unlinkLive, accountSummary,   // Round 109: the live account's store account (players.js)
+  forgetLive,   // Round 115 (launchA): a deleted live account's name and email come off its store accounts
   stats,   // Round 71: for the play-stats dashboard
   // Round 58: Big Night rooms (relay.js)
   bigNightStart, bigNightUntil, bigNightConfig, setRoomSizes, setBigNightRooms,

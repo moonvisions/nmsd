@@ -91,16 +91,47 @@
 //    (ms from now), sessionDays}. /players/status says sessionDays too.
 //  - Tests only: NMSD_TEST_CLOCK_OFFSET_MS moves this file's session clock (never set it on the real server).
 
+//
+// Round 115 (accounts115) - ACCOUNT STORAGE THAT SCALES (the launch load test: at 5,000 accounts every save froze the server for
+// half a second, and at 10,000 the accounts no longer fitted in 512 MB). The saved games now live in their own files and only a
+// small INDEX of the accounts is kept in memory - accountstore.js has the details. In short (all in STORE_DATA_DIR):
+//   players.json              the index (no saved games), one account per line; written in small slices, then renamed into place
+//   players.journal.<n>       every change since then, appended within ~0.3 s (start-up = players.json + its journals)
+//   players/<ab>/<uid>.json   each account's saved game (read when the game asks, written when it sends one; LRU cache)
+//   players.pre115.json       the ORIGINAL players.json from before this update (the one-time migration keeps it)
+// THE ONE-TIME MIGRATION (the first start of this version on an old players.json): every saved game is written to its own file
+// (with a checkpoint every 250 accounts - a restart carries on where it stopped, and doing it twice changes nothing), every file
+// is read back and checked, the counts are compared, and only then is players.json replaced by the new index. Until it's done
+// the server answers "starting up" for accounts (a few seconds for a few thousand accounts). See README.txt "ACCOUNT STORAGE".
+// ROLLBACK (back to the old players.js): set ACCOUNTS_ROLLBACK=1 on Render first - this version then writes players.json in the
+// OLD format (every account WITH its saved game), keeps the new index as players.split.json and waits ("starting up") for the old
+// players.js to be deployed. README.txt has the steps.
+// THE GITHUB BACKUP now goes to its own branch (BACKUP_GITHUB_BRANCH, "nmsd-accounts") of the same private repository: the index
+// (index.enc) and the saved games in 256 packs (saves/<ab>.enc), all encrypted as before, gzipped, and only the packs that changed
+// are sent. The branch keeps at most 24 commits before it starts again from one (so the repository stays the size of one copy).
+// The old single-file players.backup.json on the main branch is read once (the first start) and then left as it was.
+
 const fs = require('fs');
+const fsp = fs.promises;
 const path = require('path');
 const crypto = require('crypto');
+const AS = require('./accountstore');   // Round 115 (accounts115)
 
 const P = () => require('./payments');
 const LB = () => require('./leaderboards');
 
 const DIR = process.env.STORE_DATA_DIR || __dirname;
-const FILE = path.join(DIR, 'players.json');
+const FILE = path.join(DIR, 'players.json');   // Round 115 (accounts115): the INDEX now (no saved games)
 const BAK = FILE + '.bak';
+const PRE115 = path.join(DIR, 'players.pre115.json');            // Round 115 (accounts115): the original, from before the migration
+const SPLIT_ASIDE = path.join(DIR, 'players.split.json');        // Round 115 (accounts115): the index kept aside by a rollback
+const SAVES_DIR = path.join(DIR, 'players');                     // Round 115 (accounts115): players/<ab>/<uid>.json
+const MIGRATE_FILE = path.join(SAVES_DIR, '.migrate.json');      // Round 115 (accounts115): the migration's checkpoint
+const VAULT_STATE_FILE = path.join(DIR, 'players-vault.json');   // Round 115 (accounts115): what the GitHub backup has already
+const CACHE_MB = Math.max(4, Math.min(256, Number(process.env.ACCOUNT_CACHE_MB) || 24));   // Round 115 (accounts115)
+const ROLLBACK = process.env.ACCOUNTS_ROLLBACK === '1';          // Round 115 (accounts115)
+const TEST_ONLY = !process.env.RENDER;                           // (test switches below are ignored on Render)
+const MIGRATE_PAUSE_MS = TEST_ONLY ? Math.max(0, Number(process.env.NMSD_TEST_MIGRATE_PAUSE_MS) || 0) : 0;
 const MAX_PLAYERS = 500000;
 const MAX_TOKENS = 8;                  // sign-in keys kept per account (one per device; the oldest goes first)
 // Round 111 (acct111): HOW LONG A SIGN-IN LASTS, in days - the one number to change. Fixed from the sign-in (not sliding).
@@ -118,37 +149,63 @@ const TERMS_VERSION = '2026-10-14';
 const CONTACT = process.env.CONTACT_EMAIL || 'daniel@moonvisionmedia.com';
 const COMPANY = 'Moon Vision Media LLC';
 
-let state = { version: 2, savedAt: '', players: {} };   // key: lower-case username
+let state = { version: 3, savedAt: '', players: {} };   // key: lower-case username. Round 115 (accounts115): the INDEX - no saved games
 let byEmail = new Map();   // email -> key
 let byToken = new Map();   // token hash -> key
 let byUid = new Map();     // Round 109: uid -> key (connection tickets name the uid)
-let dirty = false;
 let ready = false;         // the newest copy (disk / GitHub) has been loaded
 let loadNote = '';
 
-// ------------------------------------------------------------------ storage: the disk
+// Round 115 (accounts115): what's waiting to be written
+const journal = new AS.Journal(DIR, 'players.journal');
+const saves = new AS.Saves(SAVES_DIR, CACHE_MB * 1048576);
+let dirtyKeys = new Set();       // accounts changed since the last journal write
+let tombLines = [];              // tombstones added since then (journal lines)
+let fullDirty = false;           // a change not tied to one account: the whole index is written at the next tick
+const pendingKeys = new Set();   // accounts holding a saved game in memory (from a backup / restore) that isn't in its file yet
+const unlinkQueue = new Set();   // deleted people's saved-game files, removed once their deletion is in the journal
+let snapBytes = 0, snapGen = 0, snapIsSplit = false, lastCompact = Date.now();
+let countCache = -1;
+const UID_RE = AS.UID_RE;
+let lastQ = 0;
+/** Each journal batch's order number (time-based, always rising) - start-up replays batches in this order, so the last-moment
+ *  batch written at exit can never be overtaken by one still on its way. */
+function nextQ() { lastQ = Math.max(lastQ + 1, Date.now() * 1000); return lastQ; }
 
-function readFile(file) {
-  try {
-    const data = JSON.parse(fs.readFileSync(file, 'utf8'));
-    if (data && data.players && typeof data.players === 'object') return data;
-  } catch (err) {
-    if (err && err.code !== 'ENOENT') console.error('players read', file, err.message);
-  }
-  return null;
+/** How many accounts (cached - a sign-up doesn't count 50,000 keys). */
+function accountCount() { if (countCache < 0) countCache = Object.keys(state.players).length; return countCache; }
+
+// ------------------------------------------------------------------ the index maps (email / key hash / uid -> account)
+
+/** Round 115 (accounts115): one account into the maps (and its run-out keys pruned). */
+function indexOne(key, p, at) {
+  if (!p || typeof p !== 'object') return;
+  if (p.email) byEmail.set(p.email, key);
+  if (pruneTokens(p, key, at)) dirtyKeys.add(key);   // Round 111: keys that ran out (or from before issue times) go
+  for (const t of p.tokens || []) byToken.set(t, key);
+  if (p.uid) byUid.set(p.uid, key);
 }
 
-function index() {
+/** Round 115 (accounts115): one account out of the maps. */
+function unindexOne(key, p) {
+  if (!p || typeof p !== 'object') return;
+  if (p.email && byEmail.get(p.email) === key) byEmail.delete(p.email);
+  for (const t of p.tokens || []) if (byToken.get(t) === key) byToken.delete(t);
+  if (p.uid && byUid.get(p.uid) === key) byUid.delete(p.uid);
+}
+
+/** Every account into fresh maps - in slices, so 50,000 accounts never hold the server up. */
+async function indexAll() {
   byEmail = new Map();
   byToken = new Map();
   byUid = new Map();
   const at = clock();
-  for (const [key, p] of Object.entries(state.players)) {
-    if (p.email) byEmail.set(p.email, key);
-    if (pruneTokens(p, key, at)) dirty = true;   // Round 111: keys that ran out (or from before issue times) go
-    for (const t of p.tokens || []) byToken.set(t, key);
-    if (p.uid) byUid.set(p.uid, key);
+  let i = 0;
+  for (const key of Object.keys(state.players)) {
+    indexOne(key, state.players[key], at);
+    if ((++i & 2047) === 0) await AS.nextTick();
   }
+  countCache = -1;
 }
 
 // ------------------------------------------------------------------ Round 111 (acct111): sign-ins last SESSION_DAYS days
@@ -203,19 +260,21 @@ function pruneTokens(p, key, at) {
   return changed;
 }
 
-/** Every hour: keys that ran out leave the accounts (and the next save). */
-setInterval(() => {
+/** Every hour: keys that ran out leave the accounts (and the next save). Round 115 (accounts115): in slices. */
+setInterval(async () => {
   if (!ready) return;
   const at = clock();
-  let n = 0;
-  for (const [key, p] of Object.entries(state.players)) if (pruneTokens(p, key, at)) n++;
-  if (n) save(false);
+  let i = 0;
+  for (const key of Object.keys(state.players)) {
+    const p = state.players[key];
+    if (p && pruneTokens(p, key, at)) save(false, key);
+    if ((++i & 1023) === 0) await AS.nextTick();
+  }
 }, 3600000).unref();
 
 function count(data) { return data && data.players ? Object.keys(data.players).length : 0; }
 
 // Round 109 (review H1): the account's own identity, separate from its (re-usable) username.
-const UID_RE = /^u[0-9a-f]{24}$/;
 function newUid() { return 'u' + crypto.randomBytes(12).toString('hex'); }
 /** An account from before uids: the same uid on every server and every backup (username + when it was made). */
 function legacyUid(key, p) { return 'u' + crypto.createHash('sha256').update('nmsd-legacy-uid|' + String(key).toLowerCase() + '|' + String((p && p.created) || '')).digest('hex').slice(0, 24); }
@@ -224,52 +283,439 @@ function uidOf(key, p) { return p && typeof p.uid === 'string' && UID_RE.test(p.
 function backfillUids() {
   let n = 0;
   for (const [k, p] of Object.entries(state.players)) {
-    if (p && p.uid !== uidOf(k, p)) { p.uid = uidOf(k, p); n++; }
+    if (p && p.uid !== uidOf(k, p)) { p.uid = uidOf(k, p); n++; dirtyKeys.add(k); }
   }
   return n;
 }
+const deletedUid = (uid) => !!(state.deletedUids && state.deletedUids[uid]);
 
-function newer(a, b) {
-  if (!a) return b;
-  if (!b) return a;
-  const ta = Date.parse(a.savedAt || '') || 0, tb = Date.parse(b.savedAt || '') || 0;
-  if (ta !== tb) return ta > tb ? a : b;
-  return count(a) >= count(b) ? a : b;
+// ------------------------------------------------------------------ Round 115 (accounts115): saving - the journal and compaction
+
+/** The account as it goes into the index: everything but a saved game still waiting for its file (that rides along until it's written). */
+function indexRecord(p) { return p; }
+
+/** Marks one account (its key or record) changed; nothing named = the whole index. */
+function touch(who) {
+  const key = typeof who === 'string' ? who : (who && typeof who === 'object' && who.username ? String(who.username).toLowerCase() : '');
+  if (key) dirtyKeys.add(key); else fullDirty = true;
 }
 
-/** Marks the accounts changed (written to disk within 3 s). <paramref important> (an account made, changed or deleted - not just
- *  "last seen") also sends the off-site backup soon. A number instead: send the backup within that many ms (Round 75: a
- *  progress sync goes within 30 s - soon enough, without a GitHub commit for every player every 15 s). */
-function save(important = true) {
-  dirty = true;
+/** A tombstone (deletedKeys "dk" / deletedUids "du") for the journal. */
+function tomb(kind, id, at) { tombLines.push(JSON.stringify({ [kind]: { [id]: at } })); }
+
+/** Marks the accounts changed (written to the journal within ~0.3 s). <important> (an account made, changed or deleted - not
+ *  just "last seen") also sends the off-site backup soon. A number instead: send the backup within that many ms (Round 75: a
+ *  progress sync goes within 30 s - soon enough, without a GitHub commit for every player every 15 s). Round 115 (accounts115):
+ *  <who> - the account (record or key) that changed; leave it out only for changes to many at once (the whole index is written). */
+function save(important = true, who) {
+  touch(who);
+  vault.indexDirty = true;
+  flushSoon();
   if (typeof important === 'number') vaultSoon(important);
   else if (important) vaultSoon(4000);
   else vaultSoon(600000);   // (last-seen times ride along with the next backup, at most every 10 minutes)
 }
 
-function flush() {
-  if (!dirty || !ready) return;
-  dirty = false;
-  state.savedAt = new Date().toISOString();
+let flushTimer = null;
+function flushSoon() {
+  if (flushTimer || !ready) return;
+  flushTimer = setTimeout(() => { flushTimer = null; persist().catch(() => {}); }, 300);
+}
+
+let persistChain = Promise.resolve();
+/** Everything waiting goes to the disk: saved games still in memory -> their files, changes -> the journal, a compaction when
+ *  it's due (or <force>), then the files of deleted accounts. One at a time, in order. */
+function persist(opts) {
+  const run = persistChain.then(() => persistNow(opts || {}));
+  persistChain = run.catch(err => console.error('players save', err && err.message));
+  return run;
+}
+
+async function persistNow({ force = false } = {}) {
+  if (!ready) return;
+  await spillPending();
+  await flushJournal();
+  if (force ? (journal.bytes > 0 || fullDirty || !snapIsSplit) : (fullDirty || compactDue())) await compactNow();
+  await doUnlinks();
+}
+
+/** The index is small (under 2 MB, ~2,000 accounts): compact at every tick, like the old file. Bigger: once the journal is half
+ *  the index's size, or 10 minutes old. */
+function compactDue() {
+  const jb = journal.bytes;
+  if (jb <= 0) return false;
+  return snapBytes < 2 * 1048576 || jb >= snapBytes * 0.5 || Date.now() - lastCompact > 600000;
+}
+
+/** The changed accounts -> one batch of journal lines (built in slices; appended + fdatasync'd off the main thread). */
+async function flushJournal() {
+  if (!dirtyKeys.size && !tombLines.length) return;
+  const keys = Array.from(dirtyKeys);
+  dirtyKeys = new Set();
+  const tl = tombLines;
+  tombLines = [];
+  const at = now();
+  const lines = [JSON.stringify({ s: at, q: nextQ() })].concat(tl);
+  for (let i = 0; i < keys.length; i++) {
+    const k = keys[i];
+    const p = state.players[k];
+    lines.push(p ? JSON.stringify({ u: k, r: indexRecord(p) }) : JSON.stringify({ x: k }));
+    if ((i & 511) === 511) await AS.nextTick();
+  }
   try {
-    if (fs.existsSync(FILE)) fs.copyFileSync(FILE, BAK);
-    const tmp = FILE + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify(state));
-    fs.renameSync(tmp, FILE);
+    await journal.append(lines);
+    state.savedAt = at;
+  } catch (err) {
+    for (const k of keys) dirtyKeys.add(k);
+    tombLines = tl.concat(tombLines);
+    throw err;
+  }
+}
+
+/** A fresh players.json (the index) from memory, in slices; the journal starts a new generation first, so nothing that changes
+ *  meanwhile is lost (it's in the new journal - start-up replays it on top). */
+async function compactNow() {
+  await flushJournal();
+  const gen = Math.max(journal.gen, snapGen) + 1;
+  await journal.open(gen);
+  fullDirty = false;
+  const header = { version: 3, layout: 'split', gen, savedAt: now(), deletedKeys: state.deletedKeys || {}, deletedUids: state.deletedUids || {} };
+  const r = await AS.writeSnapshot(FILE, header, Object.keys(state.players), k => { const p = state.players[k]; return p && typeof p === 'object' ? indexRecord(p) : null; }, snapIsSplit);
+  snapIsSplit = true;
+  snapGen = gen;
+  snapBytes = r.bytes;
+  lastCompact = Date.now();
+  state.savedAt = header.savedAt;
+  await journal.prune(gen - 1);   // (the generation before stays, for players.json.bak)
+}
+
+/** At exit (SIGTERM): what hasn't gone to the journal yet, synchronously (small). relay.js then waits for final(). */
+function flushSync() {
+  if (!ready || ROLLBACK) return;
+  try {
+    const lines = [];
+    if (dirtyKeys.size || tombLines.length) {
+      lines.push(JSON.stringify({ s: now(), q: nextQ() }));
+      for (const l of tombLines) lines.push(l);
+      for (const k of dirtyKeys) { const p = state.players[k]; lines.push(p ? JSON.stringify({ u: k, r: indexRecord(p) }) : JSON.stringify({ x: k })); }
+      dirtyKeys = new Set();
+      tombLines = [];
+    }
+    journal.appendSync(lines);
   } catch (err) {
     console.error('players save', err && err.message);
   }
 }
 
-setInterval(flush, 3000).unref();
-process.on('SIGTERM', () => { flush(); });
+/** (Kept for anything that called it: writes what's waiting now - async.) */
+function flush() { return persist(); }
+
+setInterval(() => { if (ready && !ROLLBACK) persist().catch(() => {}); }, 3000).unref();
+process.on('SIGTERM', () => { flushSync(); });
+
+// ------------------------------------------------------------------ Round 115 (accounts115): the saved games (their own files)
+
+/** The saved game's small summary kept in the index (for the admin page and the CSV): {stamp, role, at}. */
+function setMeta(p, prog) {
+  if (prog && prog.stamp) p.pm = { stamp: prog.stamp, role: prog.role || '', at: prog.at || '' };
+  else delete p.pm;
+}
+
+/** What the admin page shows: the saved game's stamp / role / time (from the index, or one still waiting in memory). */
+function pmOf(p) {
+  const inline = p && p.progress !== undefined ? cleanProgress(p.progress) : null;
+  const m = p && p.pm && typeof p.pm === 'object' ? p.pm : null;
+  if (inline && inline.stamp && (!m || inline.stamp >= (Number(m.stamp) || 0))) return { stamp: inline.stamp, role: inline.role, at: inline.at };
+  return m;
+}
+
+/** The account's saved game (cleaned) or null: its file, plus one still waiting in memory (the newer wins, swag united). */
+async function loadProgress(p) {
+  if (!p || !UID_RE.test(String(p.uid)) || deletedUid(p.uid)) return p ? cleanProgress(p.progress) : null;
+  const file = await saves.read(p.uid);
+  return p.progress !== undefined ? pickProgress(file, p.progress) : cleanProgress(file);
+}
+
+/** Writes the account's saved game to its file (call inside saves.lock). The one waiting in memory is then done with. */
+async function writeProgress(p, prog) {
+  const waiting = p.progress;
+  await saves.write(p.uid, prog);
+  if (p.progress === waiting && waiting !== undefined) { delete p.progress; pendingKeys.delete(String(p.username).toLowerCase()); }
+  setMeta(p, prog);
+  markShard(p.uid);
+}
+
+/** Saved games still in memory (from a backup, a restore or the migration) -> their files, 16 at a time. */
+async function spillPending() {
+  while (pendingKeys.size) {
+    const keys = Array.from(pendingKeys);
+    pendingKeys.clear();
+    let failed = 0;
+    for (let i = 0; i < keys.length; i += 16) {
+      const r = await Promise.all(keys.slice(i, i + 16).map(spillOne));
+      failed += r.filter(x => x === false).length;
+    }
+    if (failed) { console.error(`players: ${failed} saved games could not be written yet (kept in memory and in the index - trying again)`); return; }
+  }
+}
+
+/** -> true (done or nothing to do) / false (the disk said no - it stays waiting, and in the index meanwhile). */
+async function spillOne(key) {
+  const p = state.players[key];
+  if (!p || typeof p !== 'object' || p.progress === undefined) return true;
+  if (!UID_RE.test(String(p.uid)) || deletedUid(p.uid)) { delete p.progress; touch(key); return true; }
+  try {
+    await saves.lock(p.uid, async () => {
+      const waiting = p.progress;
+      if (waiting === undefined) return;
+      const file = await saves.read(p.uid);
+      const was = cleanProgress(file);
+      const both = pickProgress(file, waiting);   // (the file first: on a tie it stays - as "mine" did in merge())
+      if (both && (!was || JSON.stringify(both) !== JSON.stringify(was))) { await saves.write(p.uid, both); markShard(p.uid); }
+      if (p.progress === waiting) delete p.progress;
+      setMeta(p, both || was);
+      touch(key);
+    });
+    return true;
+  } catch (err) {
+    pendingKeys.add(key);
+    console.error('players saved game', key, err && err.message);
+    return false;
+  }
+}
+
+/** Deleted people's saved-game files go - only after their deletion is safely in the journal. */
+async function doUnlinks() {
+  if (!unlinkQueue.size) return;
+  const uids = Array.from(unlinkQueue);
+  unlinkQueue.clear();
+  await Promise.all(uids.map(uid => saves.lock(uid, () => saves.remove(uid)).catch(err => { console.error('players remove saved game', err && err.message); unlinkQueue.add(uid); })));
+}
+
+/** Once after start-up and every day: files of deleted accounts (a crash between the deletion and the file going) and stray
+ *  temp files are cleared. Files of accounts this server doesn't know are LEFT ALONE (they may belong to a backup not merged
+ *  in yet) - only counted. */
+async function sweepSaves() {
+  if (!ready) return;
+  let removed = 0, unknown = 0;
+  try {
+    for (const ab of await saves.shards()) {
+      const { uids, tmp } = await saves.listShard(ab);
+      for (const t of tmp) {
+        const f = path.join(SAVES_DIR, ab, t);
+        try { const st = await fsp.stat(f); if (Date.now() - st.mtimeMs > 3600000) { await fsp.rm(f, { force: true }); } } catch { /* */ }
+      }
+      for (const uid of uids) {
+        if (deletedUid(uid)) { await saves.lock(uid, () => saves.remove(uid)); removed++; }
+        else if (!byUid.has(uid)) unknown++;
+      }
+      await AS.nextTick();
+    }
+  } catch (err) { console.error('players sweep', err && err.message); }
+  if (removed || unknown) console.log(`players: saved games check - ${removed} of deleted accounts removed${unknown ? `, ${unknown} not matching any account (left alone)` : ''}`);
+}
+
+// ------------------------------------------------------------------ Round 115 (accounts115): loading the disk copy (and the one-time migration)
+
+function applyEntry(e) {
+  if (!e || typeof e !== 'object') return;
+  if (typeof e.s === 'string') { if (e.s > (state.savedAt || '')) state.savedAt = e.s; return; }
+  if (typeof e.u === 'string' && e.r && typeof e.r === 'object') {
+    state.players[e.u] = e.r;
+    if (e.r.progress !== undefined) pendingKeys.add(e.u); else pendingKeys.delete(e.u);
+    return;
+  }
+  if (typeof e.x === 'string') { delete state.players[e.x]; pendingKeys.delete(e.x); return; }
+  if (e.dk && typeof e.dk === 'object') for (const [k, at] of Object.entries(e.dk)) if (!state.deletedKeys[k] || state.deletedKeys[k] < at) state.deletedKeys[k] = at;
+  if (e.du && typeof e.du === 'object') for (const [u, at] of Object.entries(e.du)) if (!state.deletedUids[u] || state.deletedUids[u] < at) state.deletedUids[u] = at;
+}
+
+async function readJsonFile(file) { try { return JSON.parse(await fsp.readFile(file, 'utf8')); } catch { return null; } }
+async function writeJsonFile(file, obj) {
+  await fsp.mkdir(path.dirname(file), { recursive: true });
+  const tmp = file + '.tmp';
+  await fsp.writeFile(tmp, JSON.stringify(obj));
+  await fsp.rename(tmp, file);
+}
+
+/**
+ * Reads players.json (or its .bak if it's damaged) and the journals after it. A players.json in the OLD layout (saved games
+ * inside) is MIGRATED while it's read: each saved game goes to its own file as its account comes past, with a checkpoint every
+ * 250 accounts. -> {kind: 'none'|'split'|'legacy', file, source: {accounts, saves, skipped}, replayed}
+ */
+async function loadLocal() {
+  const have = (f) => { try { return fs.statSync(f).isFile(); } catch { return false; } };
+  const tryFiles = [FILE, BAK].filter(have);
+  for (const file of tryFiles) {
+    const header = {};
+    const src = { accounts: 0, saves: 0, skipped: 0 };
+    state = { version: 3, savedAt: '', players: {}, deletedKeys: {}, deletedUids: {} };
+    pendingKeys.clear();
+    let legacy = null, ck = null, stat = null, done = 0, sinceCk = 0;
+    try {
+      stat = fs.statSync(file);
+      await AS.scanJson(file, (k, v) => { header[k] = v; }, async (batch) => {
+        if (legacy === null) {
+          legacy = header.layout !== 'split';
+          if (legacy) ck = await startMigration(file, stat);
+        }
+        if (!legacy) {
+          for (const [key, rec] of batch) {
+            if (!rec || typeof rec !== 'object' || Array.isArray(rec)) { src.skipped++; continue; }
+            state.players[key] = rec;
+            src.accounts++;
+            if (rec.progress !== undefined) pendingKeys.add(key);
+          }
+          return;
+        }
+        // THE MIGRATION: this slice's saved games to their files (16 at a time), then a checkpoint now and then
+        const jobs = [];
+        for (const [key, rec] of batch) {
+          if (!rec || typeof rec !== 'object' || Array.isArray(rec)) { src.skipped++; continue; }
+          rec.uid = uidOf(key, rec);
+          state.players[key] = rec;
+          src.accounts++;
+          const prog = rec.progress !== undefined ? cleanProgress(rec.progress) : null;
+          if (prog) src.saves++;
+          const pos = done++;
+          if (rec.progress === undefined) continue;
+          if (ck && pos < ck.done && prog) { setMeta(rec, prog); delete rec.progress; continue; }   // (written before the restart - checked below)
+          jobs.push([key, rec]);
+        }
+        for (let i = 0; i < jobs.length; i += 16) {
+          await Promise.all(jobs.slice(i, i + 16).map(([key]) => spillOne(key)));
+        }
+        sinceCk += batch.length;
+        if (sinceCk >= 250) {
+          sinceCk = 0;
+          await writeJsonFile(MIGRATE_FILE, { src: { size: stat.size, mtimeMs: stat.mtimeMs }, done, at: now() });
+          if (MIGRATE_PAUSE_MS) await new Promise(r => setTimeout(r, MIGRATE_PAUSE_MS));   // (tests only: time to stop it halfway)
+        }
+      });
+    } catch (err) {
+      console.error('players read', file, err && err.message);
+      loadNote = 'The main accounts file was missing or damaged, so its backup copy was loaded.';
+      continue;
+    }
+    if (legacy === null) legacy = header.layout !== 'split';   // (an old file with no accounts at all)
+    state.deletedKeys = header.deletedKeys && typeof header.deletedKeys === 'object' ? header.deletedKeys : {};
+    state.deletedUids = header.deletedUids && typeof header.deletedUids === 'object' ? header.deletedUids : {};
+    state.savedAt = typeof header.savedAt === 'string' ? header.savedAt : '';
+    if (file === BAK && tryFiles[0] === FILE) loadNote = 'The main accounts file was missing or damaged, so its backup copy was loaded.';
+    if (legacy) {
+      if (!ck) ck = await startMigration(file, stat);
+      journal.archiveAll('old');   // (journals from before belong to an index this old-layout file replaced)
+      snapGen = Math.max(0, ...journal.list()) ;
+      snapIsSplit = false;
+      return { kind: 'legacy', file, source: src, replayed: 0, resumed: ck && ck.done ? ck.done : 0 };
+    }
+    snapGen = Number(header.gen) || 0;
+    snapIsSplit = true;
+    try { snapBytes = fs.statSync(file).size; } catch { snapBytes = 0; }
+    const replayed = await journal.replay(snapGen, applyEntry);
+    return { kind: 'split', file, source: src, replayed };
+  }
+  // nothing on the disk (a new server, or a free one after a redeploy) - or both copies damaged
+  state = { version: 3, savedAt: '', players: {}, deletedKeys: {}, deletedUids: {} };
+  const replayed = await journal.replay(0, applyEntry);   // (journals with no index at all: take them, rather than nothing)
+  snapGen = Math.max(0, ...journal.list());
+  return { kind: 'none', file: '', source: { accounts: 0, saves: 0, skipped: 0 }, replayed };
+}
+
+/** The migration starts (or carries on): a copy of the original file (players.pre115.json) and the checkpoint. */
+async function startMigration(file, stat) {
+  const old = await readJsonFile(MIGRATE_FILE);
+  const resume = old && old.src && old.src.size === stat.size && old.src.mtimeMs === stat.mtimeMs && Number(old.done) > 0 ? old : null;
+  const preExists = fs.existsSync(PRE115);
+  let keep = PRE115;
+  if (!(resume && preExists)) {
+    if (preExists) keep = path.join(DIR, `players.pre115.${new Date().toISOString().replace(/[-:.]/g, '').slice(0, 15)}.json`);   // (an earlier original is never overwritten)
+    await fsp.copyFile(file, keep + '.tmp');
+    await fsp.rename(keep + '.tmp', keep);
+  }
+  await fsp.mkdir(SAVES_DIR, { recursive: true });
+  if (resume) console.log(`players: carrying on with the account migration after a restart (${resume.done} accounts were done)`);
+  else { await writeJsonFile(MIGRATE_FILE, { src: { size: stat.size, mtimeMs: stat.mtimeMs }, done: 0, at: now() }); console.log(`players: migrating ${path.basename(file)} to the new account storage (the original is kept as ${path.basename(keep)})`); }
+  return resume ? { done: Number(resume.done) } : { done: 0 };
+}
+
+/** After the migration: every saved game in the old file must be in its own file - read back and checked. A saved game that
+ *  isn't is taken from the old file again and kept in memory (and in the index) until it can be written. -> {checked, bad} */
+async function verifyMigration(file) {
+  let checked = 0, bad = 0;
+  const badKeys = new Set();
+  const keys = Object.keys(state.players);
+  for (let i = 0; i < keys.length; i += 32) {
+    await Promise.all(keys.slice(i, i + 32).map(async k => {
+      const p = state.players[k];
+      if (!p || !p.pm || !p.pm.stamp || p.progress !== undefined) return;
+      checked++;
+      const text = await saves.raw(p.uid);   // (the file on the disk itself - not the cache)
+      let v = null; try { v = text ? JSON.parse(text) : null; } catch { v = null; }
+      const c = cleanProgress(v);
+      if (!c || c.stamp < p.pm.stamp) { bad++; badKeys.add(k); }
+    }));
+  }
+  if (badKeys.size) {
+    await AS.scanJson(file, () => {}, (batch) => {
+      for (const [key, rec] of batch) if (badKeys.has(key) && state.players[key] && rec && rec.progress !== undefined) { state.players[key].progress = rec.progress; pendingKeys.add(key); }
+    });
+  }
+  return { checked, bad };
+}
+
+/** Round 115 (accounts115): rollback - players.json in the OLD format (every account WITH its saved game) for the old players.js. */
+async function writeLegacyForRollback() {
+  const tmp = FILE + '.legacy.tmp';
+  const fh = await fsp.open(tmp, 'w');
+  try { await exportFull(async (text) => { await fh.write(text); }); await fh.datasync(); } finally { await fh.close(); }
+  try { if (snapIsSplit) await fsp.rename(FILE, SPLIT_ASIDE); } catch { /* */ }
+  await fsp.rm(BAK, { force: true });   // (the old players.js would load the NEWER of players.json and .bak - only the full one may be there)
+  await fsp.rename(tmp, FILE);
+  journal.archiveAll('rolledback');
+}
+
+/**
+ * Round 115 (accounts115): every account WITH its saved game, in the OLD backup format ({kind, version: 2, players: {key:
+ * {..., progress}}, deletedKeys, deletedUids}) - the admin's "Download full backup" and the rollback file. Written in slices
+ * through write(text) (which may wait), so it never holds the server up and never needs it all in memory.
+ */
+async function exportFull(write) {
+  const header = { kind: 'nmsd-live-accounts', version: 2, savedAt: now(), deletedKeys: state.deletedKeys || {}, deletedUids: state.deletedUids || {} };
+  const head = JSON.stringify(header);
+  await write(head.slice(0, -1) + ',"players":{\n');
+  const keys = Object.keys(state.players);
+  let first = true;
+  for (let i = 0; i < keys.length; i += 64) {
+    const slice = keys.slice(i, i + 64);
+    const parts = await Promise.all(slice.map(async k => {
+      const p = state.players[k];
+      if (!p || typeof p !== 'object') return '';
+      const fileProg = UID_RE.test(String(p.uid)) ? await saves.peek(p.uid) : null;
+      const prog = p.progress !== undefined ? pickProgress(fileProg, p.progress) : cleanProgress(fileProg);
+      const rec = Object.assign({}, p);
+      delete rec.pm;
+      if (prog) rec.progress = prog; else delete rec.progress;
+      return JSON.stringify(k) + ':' + JSON.stringify(rec);
+    }));
+    const text = parts.filter(Boolean).map(s => { const t = (first ? '' : ',\n') + s; first = false; return t; }).join('');
+    if (text) await write(text);
+  }
+  await write('\n}}\n');
+  return keys.length;
+}
 
 // ------------------------------------------------------------------ storage: the off-site backup (a private GitHub repo)
 
 const VAULT_REPO = (process.env.BACKUP_GITHUB_REPO || '').trim();
 const VAULT_TOKEN = (process.env.BACKUP_GITHUB_TOKEN || '').trim();
-const VAULT_PATH = 'players.backup.json';
-const vault = { on: !!(VAULT_REPO && VAULT_TOKEN && /^[\w.-]+\/[\w.-]+$/.test(VAULT_REPO)), sha: null, pushedAt: '', error: '', loaded: false, timer: null, busy: false };
+const VAULT_PATH = 'players.backup.json';   // the OLD single-file backup (read once after the update - never written again)
+const VAULT_BRANCH = (process.env.BACKUP_GITHUB_BRANCH || 'nmsd-accounts').trim().replace(/[^\w.\-\/]/g, '') || 'nmsd-accounts';   // Round 115 (accounts115)
+const VAULT_MAX_CHAIN = (TEST_ONLY && Number(process.env.NMSD_TEST_VAULT_CHAIN)) || 24;   // Round 115 (accounts115): commits on the backup branch before it starts again from one
+const VAULT_SHARDS_PER_PUSH = 64;        // Round 115 (accounts115): saved-game packs sent in one backup (the rest follow)
+const VAULT_BYTES_PER_PUSH = 24 * 1048576;
+const vault = { on: !!(VAULT_REPO && VAULT_TOKEN && /^[\w.-]+\/[\w.-]+$/.test(VAULT_REPO)), sha: null, pushedAt: '', error: '', loaded: false, timer: null, busy: false,
+  head: '', tree: '', indexSha: '', chain: 0, shards: {}, dirtyShards: new Set(), indexDirty: false, lastBytes: 0, lastPushAt: 0 };   // Round 115 (accounts115): + the branch's state
 
 // Round 110 (sec110 H1): the backup's key no longer comes from ADMIN_KEY when anything better is set. Sealing uses the
 // first of: BACKUP_KEY, BOARD_SECRET (16+ characters, mixed with its own label), and ONLY when neither is set the old
@@ -322,8 +768,10 @@ function unseal(text) {
   throw last || new Error('could not open the backup');
 }
 
+/** The OLD single-file backup (players.backup.json on the main branch) - read only, now. */
 async function github(method, body, raw) {
-  const res = await fetch(`https://api.github.com/repos/${VAULT_REPO}/contents/${VAULT_PATH}`, {
+  const base = (TEST_ONLY && process.env.NMSD_TEST_GITHUB_API) || 'https://api.github.com';   // Round 115 (accounts115): tests only
+  const res = await fetch(`${base}/repos/${VAULT_REPO}/contents/${VAULT_PATH}`, {
     method,
     headers: { authorization: `Bearer ${VAULT_TOKEN}`, accept: raw ? 'application/vnd.github.raw' : 'application/vnd.github+json', 'user-agent': 'nmsd-server', 'content-type': 'application/json' },
     body: body ? JSON.stringify(body) : undefined,
@@ -334,7 +782,7 @@ async function github(method, body, raw) {
   return { status: res.status, json, text };
 }
 
-/** The backup on GitHub: {status, data (unsealed), sha}. The file itself is read "raw" (works however big it gets). */
+/** The old backup on GitHub: {status, data (unsealed), sha}. The file itself is read "raw" (works however big it gets). */
 async function fetchRemote() {
   const meta = await github('GET');
   if (meta.status !== 200 || !meta.json) return { status: meta.status, message: meta.json && meta.json.message };
@@ -343,74 +791,150 @@ async function fetchRemote() {
   return { status: 200, sha: meta.json.sha, data: unseal(raw.text) };
 }
 
-/** Start-up: the newest of the disk copy, its .bak and the GitHub copy. */
-async function load() {
-  const disk = readFile(FILE), bak = readFile(BAK);
-  let best = newer(disk, bak);
-  if (best && disk == null) loadNote = 'The main accounts file was missing or damaged, so its backup copy was loaded.';
-  let remoteNewer = false;
-  if (vault.on) {
-    // Keep asking GitHub. With accounts on the disk, carry on after ~1 minute (and merge GitHub's later); with NO accounts
-    // on the disk (a free server after a redeploy), stay "starting up" until GitHub answers - never come up empty and
-    // send people to sign up again.
-    for (let attempt = 0; ; attempt++) {
-      try {
-        const r = await fetchRemote();
-        if (r.status === 200) {
-          vault.sha = r.sha;
-          if (r.data && r.data.players) {
-            const pick = newer(best, r.data);
-            remoteNewer = pick === r.data && count(r.data) > 0;
-            if (remoteNewer) loadNote = `Accounts loaded from the GitHub backup (${count(r.data)} accounts).`;
-            // Start from the newer copy, and take in anything only the other one has.
-            const other = pick === r.data ? best : r.data;
-            state = pick;
-            state.players = state.players || {};
-            index();
-            if (other) merge(other, true);
-            best = state;
-          }
-          vault.loaded = true;
-          vault.error = '';
-          break;
-        }
-        if (r.status === 404) { vault.loaded = true; vault.error = ''; break; }   // (no backup yet - the first push makes it)
-        vault.error = `GitHub answered ${r.status}${r.message ? ': ' + r.message : ''} - check BACKUP_GITHUB_REPO, BACKUP_GITHUB_TOKEN and BACKUP_KEY / ADMIN_KEY.`;
-      } catch (err) {
-        vault.error = 'Could not read the GitHub backup: ' + (err && err.message) + ' (if ADMIN_KEY was changed, set BACKUP_KEY to the old one).';
-      }
-      console.error('players vault', vault.error);
-      if (attempt >= 4 && count(best) > 0) break;   // the disk has accounts: carry on with them; GitHub is merged in later
-      await new Promise(r => setTimeout(r, Math.min(60000, 6000 + attempt * 6000)));
-    }
-  }
+const gitc = () => AS.gitClient(VAULT_REPO, VAULT_TOKEN);
 
-  if (best) state = best;
-  state.players = state.players || {};
-  state.deletedKeys = state.deletedKeys || {};
-  state.deletedUids = state.deletedUids || {};   // Round 109: deleted accounts, forever (a backup never brings one back)
-  state.version = 2;
-  if (backfillUids()) dirty = true;               // Round 109: (saved by the next flush)
-  index();
-  ready = true;
-  console.log(`players: ${count(state)} live accounts loaded${persistent() ? ' (disk)' : ''}${vault.on ? (vault.loaded ? ' (GitHub backup on)' : ' (GitHub backup NOT reachable)') : ''}`);
-  if (vault.on && vault.loaded && (!remoteNewer || resealNeeded) && count(state) > 0) vaultSoon(3000);   // (the disk had something newer; Round 110: or re-seal with the new key)
-  if (vault.on && !vault.loaded) setTimeout(retryVault, 120000).unref();
+function loadVaultState() {
+  try {
+    const v = JSON.parse(fs.readFileSync(VAULT_STATE_FILE, 'utf8'));
+    if (!v || v.branch !== VAULT_BRANCH || v.repo !== VAULT_REPO) return;
+    vault.head = v.head || ''; vault.tree = v.tree || ''; vault.indexSha = v.indexSha || ''; vault.chain = Number(v.chain) || 0;
+    vault.shards = v.shards && typeof v.shards === 'object' ? v.shards : {};
+    for (const ab of Array.isArray(v.dirty) ? v.dirty : []) if (/^[0-9a-f]{2}$/.test(ab)) vault.dirtyShards.add(ab);
+    vault.indexDirty = !!v.indexDirty;
+  } catch { /* none yet */ }
+}
+let vaultStateTimer = null;
+function saveVaultState() {
+  if (vaultStateTimer) return;
+  vaultStateTimer = setTimeout(() => {
+    vaultStateTimer = null;
+    writeJsonFile(VAULT_STATE_FILE, { repo: VAULT_REPO, branch: VAULT_BRANCH, head: vault.head, tree: vault.tree, indexSha: vault.indexSha, chain: vault.chain, shards: vault.shards, dirty: Array.from(vault.dirtyShards), indexDirty: vault.indexDirty })
+      .catch(err => console.error('players vault state', err && err.message));
+  }, 500);
+}
+/** A saved game changed: its pack goes with the next backup. */
+function markShard(uid) {
+  if (!vault.on) return;
+  const ab = saves.shardOf(uid);
+  if (!vault.dirtyShards.has(ab)) { vault.dirtyShards.add(ab); saveVaultState(); }
 }
 
+/** Start-up and retries: the backup branch's newest copy merged in (or, with no branch yet, the old single file). true = done. */
+async function vaultPull(alsoLegacy) {
+  const git = gitc();
+  const ref = await git.getRef(VAULT_BRANCH);
+  if (ref.status === 200 && ref.json && ref.json.object && ref.json.object.sha) {
+    if (ref.json.object.sha !== vault.head) await pullBranch(git, ref.json.object.sha, false);
+    if (alsoLegacy) await pullLegacy();
+    return true;
+  }
+  if (ref.status === 404) { await pullLegacy(); vault.indexDirty = true; return true; }   // (no branch yet: the old file - the first backup makes the branch)
+  throw new Error(`GitHub answered ${ref.status}${ref.json && ref.json.message ? ': ' + ref.json.message : ''} - check BACKUP_GITHUB_REPO, BACKUP_GITHUB_TOKEN and BACKUP_KEY / ADMIN_KEY.`);
+}
+
+/** The old single-file backup, merged in (from before this update). */
+async function pullLegacy() {
+  const r = await fetchRemote();
+  if (r.status === 200) {
+    vault.sha = r.sha;
+    if (r.data && r.data.players && count(r.data) > 0) {
+      const took = adoptRemote(r.data);
+      if (took) loadNote = `Accounts loaded from the GitHub backup (${count(r.data)} accounts).`;
+    }
+    return;
+  }
+  if (r.status === 404) return;
+  throw new Error(`GitHub answered ${r.status}${r.message ? ': ' + r.message : ''} - check BACKUP_GITHUB_REPO, BACKUP_GITHUB_TOKEN and BACKUP_KEY / ADMIN_KEY.`);
+}
+
+/** A copy of the accounts from elsewhere (GitHub): as before, the NEWER copy is the base and anything only the other has is
+ *  taken in (merge - never removing anyone, never bringing back a deleted one). -> true when the other copy was the base. */
+function adoptRemote(data) {
+  const mineAt = Date.parse(state.savedAt || '') || 0, theirsAt = Date.parse(data.savedAt || '') || 0;
+  if (count(data) > 0 && (theirsAt > mineAt || (theirsAt === mineAt && count(data) > accountCount()))) {
+    const mine = { players: state.players, deletedKeys: state.deletedKeys || {}, deletedUids: state.deletedUids || {} };
+    state = { version: 3, savedAt: data.savedAt || '', players: data.players, deletedKeys: data.deletedKeys || {}, deletedUids: data.deletedUids || {} };
+    for (const [k, p] of Object.entries(state.players)) {
+      if (!p || typeof p !== 'object') { delete state.players[k]; continue; }
+      if (p.progress !== undefined) pendingKeys.add(k);
+    }
+    byEmail = new Map(); byToken = new Map(); byUid = new Map();
+    const at = clock();
+    for (const [k, p] of Object.entries(state.players)) indexOne(k, p, at);   // (rare: a start-up, or two servers at once - sign-ins must work straight away)
+    merge(mine, true);
+    fullDirty = true;
+    countCache = -1;
+    return true;
+  }
+  merge(data, true);
+  return false;
+}
+
+/** The backup branch at commit <head>: its index merged in, and the saved-game packs that differ from what this server has
+ *  taken in before (so a server with its disk downloads nothing). */
+async function pullBranch(git, head, conflict) {
+  const c = await git.getCommit(head);
+  if (c.status !== 200 || !c.json || !c.json.tree) throw new Error(`GitHub answered ${c.status} (backup commit)`);
+  const t = await git.getTree(c.json.tree.sha);
+  if (t.status !== 200 || !t.json || !Array.isArray(t.json.tree)) throw new Error(`GitHub answered ${t.status} (backup tree)`);
+  const keys = vaultKeys();
+  const entries = t.json.tree;
+  const ie = entries.find(e => e.path === 'index.enc');
+  if (ie && ie.sha !== vault.indexSha) {
+    const b = await git.getBlob(ie.sha);
+    if (b.status !== 200) throw new Error(`GitHub answered ${b.status} (backup index)`);
+    const opened = await AS.openBox(b.buf.toString('utf8'), keys);
+    if (opened.keyIndex > 0) resealNeeded = true;
+    const data = { players: {}, deletedKeys: {}, deletedUids: {}, savedAt: '' };
+    await AS.scanJson(opened.buf, (k, v) => { if (k !== 'players') data[k] = v; }, (batch) => { for (const [k, v] of batch) data.players[k] = v; });
+    if (count(data) > 0 || Object.keys(data.deletedUids || {}).length) adoptRemote(data);
+    vault.indexSha = ie.sha;
+  }
+  const seen = new Set();
+  for (const e of entries) {
+    const m = /^saves\/([0-9a-f]{2})\.enc$/.exec(e.path || '');
+    if (!m) continue;
+    const ab = m[1];
+    seen.add(ab);
+    if (vault.shards[ab] === e.sha) continue;
+    const b = await git.getBlob(e.sha);
+    if (b.status !== 200) throw new Error(`GitHub answered ${b.status} (backup saves ${ab})`);
+    const opened = await AS.openBox(b.buf.toString('utf8'), keys);
+    if (opened.keyIndex > 0) resealNeeded = true;
+    const pack = JSON.parse(opened.buf.toString('utf8'));
+    let mineNewer = conflict;
+    for (const [uid, prog] of Object.entries(pack || {})) {
+      const key = byUid.get(uid);
+      const p = key ? state.players[key] : null;
+      if (!p || deletedUid(uid)) { mineNewer = true; continue; }
+      const inc = cleanProgress(prog);
+      if (!inc) continue;
+      const m2 = pmOf(p);
+      if (m2 && m2.stamp > inc.stamp) mineNewer = true;
+      p.progress = p.progress !== undefined ? pickProgress(p.progress, inc) : inc;
+      pendingKeys.add(key);
+    }
+    vault.shards[ab] = e.sha;
+    if (mineNewer) vault.dirtyShards.add(ab);
+    await spillPending();   // (pack by pack into the files - never every saved game in memory at once)
+  }
+  for (const ab of Object.keys(vault.shards)) if (!seen.has(ab)) { delete vault.shards[ab]; vault.dirtyShards.add(ab); }
+  vault.head = head;
+  vault.tree = c.json.tree.sha;
+  saveVaultState();
+}
+
+/** Start-up didn't reach GitHub (and the disk had accounts): keep trying every 5 minutes, then merge and back up. */
 async function retryVault() {
   try {
-    const r = await fetchRemote();
-    if (r.status === 200) {
-      vault.sha = r.sha;
-      merge(r.data, true);
+    if (await vaultPull(false)) {
       vault.loaded = true;
       vault.error = '';
+      vault.indexDirty = true;
+      flushSoon();
       vaultSoon(1000);
       return;
     }
-    if (r.status === 404) { vault.loaded = true; vault.error = ''; vaultSoon(1000); return; }
-    vault.error = `GitHub answered ${r.status}`;
   } catch (err) {
     vault.error = 'Could not read the GitHub backup: ' + (err && err.message);
   }
@@ -418,19 +942,23 @@ async function retryVault() {
 }
 
 let vaultDue = 0;
+/** Round 115 (accounts115): the smallest gap between two backups grows with their size (about 20 s per MB, at most 20 minutes) -
+ *  a few thousand accounts still go within seconds; 50,000 every several minutes. */
+function vaultGap() { return Math.min(1200000, Math.round(vault.lastBytes / 1048576 * 20000)); }
 function vaultSoon(ms) {
-  if (!vault.on || !vault.loaded || !ready) return;
-  const due = Date.now() + (ms || 4000);
+  if (!vault.on || !vault.loaded || !ready || ROLLBACK) return;
+  const due = Math.max(Date.now() + (ms || 4000), vault.lastPushAt + vaultGap());
   if (vault.timer && vaultDue <= due) return;   // (one already due sooner)
   if (vault.timer) clearTimeout(vault.timer);
   vaultDue = due;
-  vault.timer = setTimeout(() => { vault.timer = null; push(); }, due - Date.now());
+  vault.timer = setTimeout(() => { vault.timer = null; push(); }, Math.max(0, due - Date.now()));
   if (vault.timer.unref) vault.timer.unref();
 }
 
-/** Stopping (a redeploy): the accounts to disk and, if a backup is waiting, to GitHub now (the relay waits a few seconds). */
+/** Stopping (a redeploy): everything to the disk (a compaction, so the next start reads one file) and, if a backup is waiting,
+ *  to GitHub now (the relay waits a few seconds). */
 async function final() {
-  flush();
+  if (ready && !ROLLBACK) await persist({ force: true });
   if (vault.timer) {
     clearTimeout(vault.timer);
     vault.timer = null;
@@ -439,32 +967,13 @@ async function final() {
 }
 
 async function push() {
-  if (!vault.on || !vault.loaded || !ready || vault.busy) return;
+  if (!vault.on || !vault.loaded || !ready || vault.busy || ROLLBACK) return;
   vault.busy = true;
   try {
-    const snapshot = Object.assign({}, state, { savedAt: new Date().toISOString() });
-    const content = Buffer.from(seal(snapshot), 'utf8').toString('base64');
-    let r = await github('PUT', { message: `accounts backup (${count(snapshot)})`, content, sha: vault.sha || undefined });
-    if (r.status === 409 || r.status === 422) {
-      // Someone else saved since (the other server during a redeploy): take in their accounts first, then save both.
-      const g = await fetchRemote();
-      if (g.status === 200) {
-        vault.sha = g.sha;
-        merge(g.data, true);
-        flush();
-      }
-      const both = Object.assign({}, state, { savedAt: new Date().toISOString() });
-      r = await github('PUT', { message: `accounts backup (${count(both)})`, content: Buffer.from(seal(both), 'utf8').toString('base64'), sha: vault.sha || undefined });
-    }
-    if (r.status === 200 || r.status === 201) {
-      vault.sha = r.json && r.json.content ? r.json.content.sha : vault.sha;
-      vault.pushedAt = new Date().toISOString();
-      vault.error = '';
-    } else {
-      vault.error = `Backup push failed: GitHub answered ${r.status}${r.json && r.json.message ? ' (' + r.json.message + ')' : ''}.`;
-      console.error('players vault', vault.error);
-      setTimeout(() => vaultSoon(), 60000).unref();
-    }
+    let r = 'conflict';
+    for (let attempt = 0; attempt < 3 && r === 'conflict'; attempt++) r = await pushOnce();
+    if (r === 'conflict') throw new Error('the backup kept changing on GitHub (another copy of the server?) - trying again in a minute');
+    if (vault.dirtyShards.size) vaultSoon(5000);   // (more saved-game packs to send)
   } catch (err) {
     vault.error = 'Backup push failed: ' + (err && err.message);
     console.error('players vault', vault.error);
@@ -474,19 +983,119 @@ async function push() {
   }
 }
 
+/** One saved-game pack: {"<uid>": saved game, ...} of the shard's live accounts (the files as they are), sealed. null = empty. */
+async function packShard(ab, key) {
+  const { uids } = await saves.listShard(ab);
+  const parts = [];
+  for (let i = 0; i < uids.length; i += 16) {
+    const got = await Promise.all(uids.slice(i, i + 16).map(async uid => {
+      const k = byUid.get(uid);
+      const p = k ? state.players[k] : null;
+      if (!p || deletedUid(uid)) return '';
+      let text = await saves.raw(uid);
+      if (p.progress !== undefined) { const both = pickProgress(text ? JSON.parse(text) : null, p.progress); text = both ? JSON.stringify(both) : null; }
+      return text ? JSON.stringify(uid) + ':' + text : '';
+    }));
+    for (const s of got) if (s) parts.push(s);
+  }
+  if (!parts.length) return null;
+  return { text: await AS.packBox('{' + parts.join(',') + '}', key, { kind: 'saves', shard: ab, n: parts.length }), n: parts.length };
+}
+
+/** One backup: the index (always) and up to VAULT_SHARDS_PER_PUSH changed saved-game packs, in ONE commit on the backup branch.
+ *  -> 'ok' or 'conflict' (someone else moved the branch: their copy was merged in - push again on top). */
+async function pushOnce() {
+  const git = gitc();
+  const key = vaultKey();
+  if (!key) throw new Error('BACKUP_KEY / ADMIN_KEY not set');
+  const ref = await git.getRef(VAULT_BRANCH);
+  if (ref.status !== 200 && ref.status !== 404) throw new Error(`GitHub answered ${ref.status}${ref.json && ref.json.message ? ' (' + ref.json.message + ')' : ''}`);
+  const remoteHead = ref.status === 200 && ref.json && ref.json.object ? ref.json.object.sha : '';
+  if (remoteHead && remoteHead !== vault.head) { await pullBranch(git, remoteHead, true); flushSoon(); return 'conflict'; }
+  if (!remoteHead) { vault.shards = {}; vault.tree = ''; vault.chain = 0; vault.indexSha = ''; }
+  if (!remoteHead || resealNeeded) for (const ab of await saves.shards()) vault.dirtyShards.add(ab);
+  await persist({ force: true });   // (players.json is now the whole index, as of this moment)
+  const indexDirtyWas = vault.indexDirty;
+  vault.indexDirty = false;
+  const taken = [];
+  try {
+    const entries = [];
+    const n = accountCount();
+    const savedAt = now();
+    const indexBox = await AS.packBox(await fsp.readFile(FILE), key, { kind: 'index', layout: 'split', players: n, savedAt });
+    let bytes = indexBox.length;
+    const ib = await git.createBlob(Buffer.from(indexBox, 'utf8'));
+    if (ib.status !== 201 || !ib.json) throw new Error(`GitHub answered ${ib.status} (index)`);
+    entries.push({ path: 'index.enc', mode: '100644', type: 'blob', sha: ib.json.sha });
+    const todo = Array.from(vault.dirtyShards).sort();
+    for (const ab of todo) {
+      if (taken.length >= VAULT_SHARDS_PER_PUSH || bytes >= VAULT_BYTES_PER_PUSH) break;
+      vault.dirtyShards.delete(ab);
+      taken.push([ab, null]);
+      const pack = await packShard(ab, key);
+      if (!pack) { if (vault.shards[ab]) entries.push({ path: `saves/${ab}.enc`, mode: '100644', type: 'blob', sha: null }); continue; }
+      const b = await git.createBlob(Buffer.from(pack.text, 'utf8'));
+      if (b.status !== 201 || !b.json) throw new Error(`GitHub answered ${b.status} (saves ${ab})`);
+      taken[taken.length - 1][1] = b.json.sha;
+      entries.push({ path: `saves/${ab}.enc`, mode: '100644', type: 'blob', sha: b.json.sha });
+      bytes += pack.text.length;
+    }
+    const shardsAfter = Object.assign({}, vault.shards);
+    for (const [ab, sha] of taken) { if (sha) shardsAfter[ab] = sha; else delete shardsAfter[ab]; }
+    const manifest = JSON.stringify({ what: 'New Moon, Same Dark - live accounts backup (encrypted). index.enc = the accounts, saves/*.enc = their saved games.', layout: 'split', savedAt, accounts: n, savePacks: Object.keys(shardsAfter).length }, null, 1);
+    const mb = await git.createBlob(Buffer.from(manifest, 'utf8'));
+    if (mb.status !== 201 || !mb.json) throw new Error(`GitHub answered ${mb.status} (manifest)`);
+    entries.push({ path: 'manifest.json', mode: '100644', type: 'blob', sha: mb.json.sha });
+    const tr = await git.createTree(remoteHead ? vault.tree || undefined : undefined, entries);
+    if (tr.status !== 201 || !tr.json) throw new Error(`GitHub answered ${tr.status} (tree)`);
+    const restart = !remoteHead || vault.chain >= VAULT_MAX_CHAIN;   // (start the branch again from one commit: its size stays one copy)
+    const cm = await git.createCommit(`accounts backup (${n} accounts, ${taken.length} save packs)`, tr.json.sha, restart ? [] : [remoteHead]);
+    if (cm.status !== 201 || !cm.json) throw new Error(`GitHub answered ${cm.status} (commit)`);
+    let up;
+    if (!remoteHead) up = await git.createRef(VAULT_BRANCH, cm.json.sha);
+    else {
+      if (restart) { const again = await git.getRef(VAULT_BRANCH); if (!again.json || !again.json.object || again.json.object.sha !== remoteHead) throw Object.assign(new Error('moved'), { conflict: true }); }
+      up = await git.updateRef(VAULT_BRANCH, cm.json.sha, restart);
+    }
+    if (up.status === 422 || up.status === 409) throw Object.assign(new Error('moved'), { conflict: true });
+    if (up.status !== 200 && up.status !== 201) throw new Error(`GitHub answered ${up.status} (branch)`);
+    vault.head = cm.json.sha;
+    vault.tree = tr.json.sha;
+    vault.indexSha = ib.json.sha;
+    vault.chain = restart ? 1 : vault.chain + 1;
+    vault.shards = shardsAfter;
+    vault.pushedAt = now();
+    vault.error = '';
+    vault.lastBytes = bytes;
+    vault.lastPushAt = Date.now();
+    resealNeeded = false;
+    saveVaultState();
+    return 'ok';
+  } catch (err) {
+    for (const [ab] of taken) vault.dirtyShards.add(ab);
+    vault.indexDirty = vault.indexDirty || indexDirtyWas;
+    saveVaultState();
+    if (err && err.conflict) return 'conflict';
+    throw err;
+  }
+}
+
 /** Adds a backup's accounts (the newer copy of each), never removing any - and never bringing back one that was deleted
- *  here. <quiet>: don't schedule a backup just for this. Returns how many were added or updated. */
+ *  here. <quiet>: don't schedule a backup just for this. Returns how many were added or updated.
+ *  Round 115 (accounts115): the maps are updated account by account (not rebuilt), and a saved game from the backup waits in
+ *  memory (p.progress) until it's merged with the account's file (the newer one wins, swag united - as before). */
 function merge(data, quiet) {
   if (!data || !data.players || typeof data.players !== 'object') return 0;
   state.deletedKeys = state.deletedKeys || {};
   state.deletedUids = state.deletedUids || {};
   for (const [k, at] of Object.entries(data.deletedKeys || {})) {
-    if (!state.deletedKeys[k] || state.deletedKeys[k] < at) state.deletedKeys[k] = at;
+    if (!state.deletedKeys[k] || state.deletedKeys[k] < at) { state.deletedKeys[k] = at; tomb('dk', k, at); }
   }
   for (const [u, at] of Object.entries(data.deletedUids || {})) {   // Round 109
-    if (UID_RE.test(u) && (!state.deletedUids[u] || state.deletedUids[u] < at)) state.deletedUids[u] = at;
+    if (UID_RE.test(u) && (!state.deletedUids[u] || state.deletedUids[u] < at)) { state.deletedUids[u] = at; tomb('du', u, at); }
   }
   let n = 0;
+  const at = clock();
   for (const [key, p] of Object.entries(data.players)) {
     if (!p || typeof p !== 'object' || !p.username || !p.email) continue;
     const k = String(p.username).toLowerCase();
@@ -505,9 +1114,16 @@ function merge(data, quiet) {
       // Round 75: my copy of the account stays, but their saved game may still be newer (synced on the other server).
       // Round 109: the newer saved game, with both copies' swag (a union - never lost) and the store link if mine has none
       // (the same person - checked just above).
-      const both = pickProgress(mine.progress, p.progress);
-      if (both && JSON.stringify(both) !== JSON.stringify(mine.progress)) { mine.progress = both; n++; }
-      if (!mine.store && p.store) { mine.store = p.store; n++; }
+      if (p.progress !== undefined) {
+        if (mine.progress !== undefined) {
+          const both = pickProgress(mine.progress, p.progress);
+          if (both && JSON.stringify(both) !== JSON.stringify(mine.progress)) { mine.progress = both; pendingKeys.add(k); dirtyKeys.add(k); n++; }
+        } else {
+          const inc = cleanProgress(p.progress);   // Round 115 (accounts115): mine is in its file - merged there (spillPending)
+          if (inc) { const m = pmOf(mine); mine.progress = inc; pendingKeys.add(k); dirtyKeys.add(k); if (!m || inc.stamp > m.stamp) n++; }
+        }
+      }
+      if (!mine.store && p.store) { mine.store = p.store; dirtyKeys.add(k); n++; }
       continue;
     }
     const other = byEmail.get(p.email);
@@ -516,25 +1132,141 @@ function merge(data, quiet) {
       const both = pickProgress(mine.progress, p.progress);   // (the same person: the newer saved game - Round 109: + both swags)
       if (both) p.progress = both;
       if (!p.store && mine.store) p.store = mine.store;
+      const pm = mine.pm;   // Round 115 (accounts115): (the file is the same - it goes by the uid)
+      if (pm && pm.stamp && (!p.pm || !(p.pm.stamp >= pm.stamp))) p.pm = pm;
+      unindexOne(k, mine);
     }
     p.uid = uid;
     state.players[k] = p;
+    indexOne(k, p, at);
+    if (p.progress !== undefined) pendingKeys.add(k); else pendingKeys.delete(k);
+    dirtyKeys.add(k);
+    countCache = -1;
     n++;
   }
   // Accounts deleted elsewhere (the other server) go here too - by uid; for an old tombstone by name, only the account
   // that existed then (one made after it was deleted is a new person).
-  for (const [k, mine] of Object.entries(state.players)) {
+  for (const k of Object.keys(state.players)) {
+    const mine = state.players[k];
     const u = uidOf(k, mine);
-    const at = Date.parse(state.deletedKeys[k] || '') || 0;
-    const madeAt = Date.parse(mine.created || '') || 0;
-    if (state.deletedUids[u] || (at && madeAt <= at && (Date.parse(mine.updated || mine.created || '') || 0) <= at)) { delete state.players[k]; n++; }
+    const dk = state.deletedKeys[k];
+    let drop = !!state.deletedUids[u];
+    if (!drop && dk) {
+      const atDel = Date.parse(dk) || 0;
+      const madeAt = Date.parse((mine && mine.created) || '') || 0;
+      drop = !!(atDel && madeAt <= atDel && (Date.parse((mine && (mine.updated || mine.created)) || '') || 0) <= atDel);
+    }
+    if (drop) {
+      unindexOne(k, mine);
+      delete state.players[k];
+      pendingKeys.delete(k);
+      dirtyKeys.add(k);
+      if (UID_RE.test(u)) { saves.forget(u); unlinkQueue.add(u); markShard(u); }
+      countCache = -1;
+      n++;
+    }
   }
-  index();
-  if (n) { dirty = true; if (!quiet) vaultSoon(4000); }
+  if (n) { vault.indexDirty = true; flushSoon(); if (!quiet) vaultSoon(4000); }
   return n;
 }
 
-load();
+/** Start-up: the disk copy (migrated if it's in the old layout), then the newest of it and the GitHub backup. */
+async function load() {
+  const t0 = Date.now();
+  let local = { kind: 'none', source: { accounts: 0, saves: 0, skipped: 0 }, replayed: 0 };
+  try {
+    local = await loadLocal();
+  } catch (err) {
+    console.error('players load', err && err.message);
+  }
+  const legacy = local.kind === 'legacy';
+  if (vault.on) {
+    loadVaultState();
+    if (legacy) { vault.head = ''; vault.indexSha = ''; vault.shards = {}; }   // (a fresh start for the branch after a migration)
+    // Keep asking GitHub. With accounts on the disk, carry on after ~1 minute (and merge GitHub's later); with NO accounts
+    // on the disk (a free server after a redeploy), stay "starting up" until GitHub answers - never come up empty and
+    // send people to sign up again.
+    for (let attempt = 0; ; attempt++) {
+      try {
+        if (await vaultPull(legacy)) { vault.loaded = true; vault.error = ''; break; }
+      } catch (err) {
+        vault.error = 'Could not read the GitHub backup: ' + (err && err.message) + ' (if ADMIN_KEY was changed, set BACKUP_KEY to the old one).';
+      }
+      console.error('players vault', vault.error);
+      if (attempt >= 4 && accountCount() > 0) break;   // the disk has accounts: carry on with them; GitHub is merged in later
+      await new Promise(r => setTimeout(r, Math.min(60000, 6000 + attempt * 6000)));
+    }
+  }
+
+  state.players = state.players || {};
+  state.deletedKeys = state.deletedKeys || {};
+  state.deletedUids = state.deletedUids || {};   // Round 109: deleted accounts, forever (a backup never brings one back)
+  state.version = 3;
+  backfillUids();                                 // Round 109
+  await indexAll();
+  // Round 115 (accounts115): saved games still in memory (from a backup) -> their files, before anyone is let in
+  await spillPending();
+  let verified = null;
+  if (legacy) {
+    verified = await verifyMigration(local.file);
+    if (verified.bad) { await spillPending(); console.error(`players: ${verified.bad} saved games didn't check out after the migration - taken from the old file again`); }
+    const n = accountCount();
+    const expect = local.source.accounts;
+    if (n < expect) console.error(`players: MIGRATION COUNT CHECK - the old file had ${expect} accounts, ${n} are loaded`);
+  }
+  if (ROLLBACK) {
+    // Round 115 (accounts115): THE ROLLBACK - players.json in the old format, then wait for the old players.js
+    try {
+      await writeLegacyForRollback();
+      loadNote = 'ROLLBACK READY: players.json is in the OLD format again (every account with its saved game). Deploy the old players.js now, then delete ACCOUNTS_ROLLBACK on Render.';
+    } catch (err) {
+      loadNote = 'ROLLBACK FAILED: ' + (err && err.message) + ' - nothing was changed; delete ACCOUNTS_ROLLBACK on Render to carry on.';
+    }
+    console.log('players: ' + loadNote);
+    return;   // (stays "starting up" - nothing more is written by this version)
+  }
+  // the index from now on: one fresh players.json (always after a migration), then the journal
+  if (legacy || local.kind !== 'split' || local.replayed > 0 || fullDirty || dirtyKeys.size || tombLines.length) {
+    dirtyKeys = new Set(); tombLines = [];
+    if (legacy) { try { fs.renameSync(BAK, path.join(DIR, 'players.pre115.bak.json')); } catch { /* none */ } }   // (an old-layout .bak never stands in for the new index)
+    const gen = Math.max(snapGen, 0, ...journal.list()) + 1;
+    await journal.open(gen);
+    fullDirty = false;
+    const header = { version: 3, layout: 'split', gen, savedAt: now(), deletedKeys: state.deletedKeys, deletedUids: state.deletedUids };
+    try {
+      const r = await AS.writeSnapshot(FILE, header, Object.keys(state.players), k => { const p = state.players[k]; return p && typeof p === 'object' ? indexRecord(p) : null; }, snapIsSplit);
+      snapIsSplit = true; snapGen = gen; snapBytes = r.bytes; lastCompact = Date.now(); state.savedAt = header.savedAt;
+      await journal.prune(gen - 1);
+    } catch (err) {
+      // during the migration: stop here (the old players.json is untouched; the next start carries on). Otherwise carry on -
+      // the old index + its journals are still complete, and the next compaction tries again.
+      if (legacy) throw err;
+      fullDirty = true;
+      console.error('players: could not write the index at start-up (carrying on with the journal):', err && err.message);
+    }
+  } else {
+    await journal.open(snapGen);
+  }
+  if (legacy) {
+    await fsp.rm(MIGRATE_FILE, { force: true });
+    for (const ab of await saves.shards()) vault.dirtyShards.add(ab);
+    vault.indexDirty = true;
+    console.log(`players: MIGRATION DONE in ${((Date.now() - t0) / 1000).toFixed(1)} s - ${local.source.accounts} accounts (${accountCount()} now), ${local.source.saves} saved games moved to their own files, ${verified ? verified.checked : 0} checked${verified && verified.bad ? `, ${verified.bad} taken again from the old file` : ''}${local.resumed ? ` (carried on from ${local.resumed} after a restart)` : ''}. The original is kept as players.pre115.json.`);
+    loadNote = loadNote || `Accounts moved to the new storage on ${now().slice(0, 16).replace('T', ' ')} UTC (${local.source.accounts} accounts, ${local.source.saves} saved games). The original file is kept as players.pre115.json.`;
+  }
+  countCache = -1;
+  ready = true;
+  console.log(`players: ${accountCount()} live accounts loaded${persistent() ? ' (disk)' : ''}${vault.on ? (vault.loaded ? ' (GitHub backup on)' : ' (GitHub backup NOT reachable)') : ''} in ${Date.now() - t0} ms`);
+  if (vault.on && vault.loaded && accountCount() > 0 && (vault.indexDirty || vault.dirtyShards.size || resealNeeded || !vault.head)) vaultSoon(3000);   // (the disk had something newer; Round 110: or re-seal with the new key)
+  if (vault.on && !vault.loaded) setTimeout(retryVault, 120000).unref();
+  setTimeout(() => { sweepSaves().catch(() => {}); }, TEST_ONLY && process.env.NMSD_TEST_SWEEP_MS ? Number(process.env.NMSD_TEST_SWEEP_MS) : 20000).unref();
+  setInterval(() => { sweepSaves().catch(() => {}); }, 86400000).unref();
+}
+
+load().catch(err => {
+  console.error('players load', err && err.stack || err);
+  loadNote = 'The accounts could not be loaded: ' + (err && err.message) + ' - nothing was changed or deleted. Check Render > Logs (is the disk full?) and restart.';
+});
 
 // ------------------------------------------------------------------ helpers
 
@@ -554,7 +1286,10 @@ const sha = (s) => crypto.createHash('sha256').update(String(s)).digest('hex');
 function cleanUsername(text) { return String(text || '').replace(/[^A-Za-z0-9_.-]/g, '').slice(0, 16); }
 function cleanEmail(text) { return String(text || '').trim().toLowerCase().slice(0, 120); }
 function validEmail(email) { return /^[^\s@<>"']+@[^\s@<>"']+\.[a-z]{2,}$/.test(email); }
-function rude(name) { try { return LB().isRude(name); } catch { return false; } }
+function rude(name) {
+  try { if (require('./wordfilter').nameBad(name)) return true; } catch { /* the boards' list below still runs */ }   // Round 115 (launchC): the server's one word list
+  try { return LB().isRude(name); } catch { return false; }
+}
 
 function passwordProblem(pw, username) {
   pw = String(pw || '');
@@ -624,7 +1359,7 @@ function checkWhy(token) {
   const p = key ? state.players[key] || null : null;
   if (p) {
     if (tokenLive(p, hash)) return { p, hash, expired: false };
-    if (pruneTokens(p, key, clock())) save(false);
+    if (pruneTokens(p, key, clock())) save(false, key);   // Round 115 (accounts115): + which account
     noteExpired(hash);
     return { p: null, hash, expired: true };
   }
@@ -670,6 +1405,9 @@ function trimHits(now) {
   let drop = hits.size - 15000;
   for (const k of hits.keys()) { if (drop-- <= 0) break; hits.delete(k); }
 }
+
+/** Round 115 (accounts115): takes back the last hit (the thing it counted didn't happen - e.g. the disk refused a save). */
+function unlimit(key) { const list = hits.get(key); if (list && list.length) list.pop(); }
 
 /** Over the limit already (without counting this one). */
 function peek(key, max, ms) {
@@ -744,9 +1482,9 @@ function pickProgress(a, b) {
   return out;
 }
 
-function progressOf(p) {
-  const s = cleanProgress(p && p.progress);
-  return s ? { stamp: s.stamp, social: s.social, progress: s.progress, role: s.role, identity: s.identity, swag: s.swag }
+/** The reply fields of a saved game. Round 115 (accounts115): takes the saved game itself (loadProgress), not the account. */
+function progressOf(s) {
+  return s ?{ stamp: s.stamp, social: s.social, progress: s.progress, role: s.role, identity: s.identity, swag: s.swag }
     : { stamp: 0, social: '', progress: '', role: '', identity: '', swag: [] };
 }
 
@@ -782,10 +1520,17 @@ function progressRoute(req, res) {
   const why = byBearerWhy(req);   // Round 111
   const p = why.p;
   if (!p) { json(res, 401, signinReply(why, { error: 'sign in' })); return; }
-  if (req.method === 'GET') { json(res, 200, Object.assign({ ok: true }, progressOf(p))); return; }
+  // Round 115 (accounts115): the saved game is read from its own file (or the cache) - the same answer as before
+  if (req.method === 'GET') {
+    loadProgress(p).then(s => json(res, 200, Object.assign({ ok: true }, progressOf(s)))).catch(err => {
+      console.error('players progress', err && err.message);
+      json(res, 500, { ok: false, error: 'try again' });
+    });
+    return;
+  }
   if (req.method !== 'POST') { json(res, 405, { ok: false, error: 'use GET or POST' }); return; }
   const key = p.username.toLowerCase();
-  readJsonOrTooBig(req, MAX_PROGRESS_BODY).then(body => {
+  readJsonOrTooBig(req, MAX_PROGRESS_BODY).then(async body => {
     if (body === null) { json(res, 413, { ok: false, error: 'too big' }); setImmediate(() => req.destroy()); return; }
     const incoming = cleanProgress(body);
     if (!incoming || !incoming.stamp) { json(res, 400, { ok: false, error: 'stamp (ms since epoch), social, progress and role are needed' }); return; }
@@ -795,25 +1540,31 @@ function progressRoute(req, res) {
     if (body.identity !== undefined && typeof body.identity !== 'string') { json(res, 400, { ok: false, error: 'identity must be a string' }); return; }
     if (typeof body.identity === 'string' && body.identity.length > MAX_IDENTITY) { json(res, 413, { ok: false, error: 'identity is too big' }); return; }
     if (body.swag !== undefined && !Array.isArray(body.swag)) { json(res, 400, { ok: false, error: 'swag must be a list' }); return; }
-    const stored = cleanProgress(p.progress);
-    const swag = unionSwag(stored ? stored.swag : [], body.swag);
-    if (stored && stored.stamp > incoming.stamp) {
-      // (the game decides) - Round 109: but a new swag unlock is never turned away: it joins the stored copy now.
-      if (swag.length > stored.swag.length) { p.progress.swag = swag; save(30000); }
-      json(res, 200, Object.assign({ ok: false, stale: true }, progressOf(p)));
-      return;
-    }
-    if (peek('prog|' + key, 1, PROGRESS_GAP)) { json(res, 429, { ok: false, error: 'slow down' }); return; }
-    limited('prog|' + key, 1, PROGRESS_GAP);
-    // Round 109 (review L6): an empty identity never replaces a stored one (only a real character does).
-    const identity = typeof body.identity === 'string' && body.identity.length > 0 ? body.identity : (stored ? stored.identity : '');
-    p.progress = { stamp: incoming.stamp, social: incoming.social, progress: incoming.progress, role: incoming.role, identity, swag, at: now() };
-    p.seen = now();
-    save(30000);
-    json(res, 200, { ok: true, stamp: incoming.stamp, swag });   // Round 109: + the account's swag (the union)
+    // Round 115 (accounts115): read - decide - write under this account's lock (its own file, written atomically before the answer)
+    await saves.lock(p.uid, async () => {
+      if (state.players[key] !== p) { json(res, 401, signinReply({ expired: false }, { error: 'sign in' })); return; }   // (deleted a moment ago)
+      const stored = await loadProgress(p);
+      const swag = unionSwag(stored ? stored.swag : [], body.swag);
+      if (stored && stored.stamp > incoming.stamp) {
+        // (the game decides) - Round 109: but a new swag unlock is never turned away: it joins the stored copy now.
+        let kept = stored;
+        if (swag.length > stored.swag.length) { kept = Object.assign({}, stored, { swag }); await writeProgress(p, kept); save(30000, p); }
+        json(res, 200, Object.assign({ ok: false, stale: true }, progressOf(kept)));
+        return;
+      }
+      if (peek('prog|' + key, 1, PROGRESS_GAP)) { json(res, 429, { ok: false, error: 'slow down' }); return; }
+      limited('prog|' + key, 1, PROGRESS_GAP);
+      // Round 109 (review L6): an empty identity never replaces a stored one (only a real character does).
+      const identity = typeof body.identity === 'string' && body.identity.length > 0 ? body.identity : (stored ? stored.identity : '');
+      const next = { stamp: incoming.stamp, social: incoming.social, progress: incoming.progress, role: incoming.role, identity, swag, at: now() };
+      try { await writeProgress(p, next); } catch (err) { unlimit('prog|' + key); throw err; }   // (the disk said no: "try again" - without a 15 s wait)
+      p.seen = now();
+      save(30000, p);
+      json(res, 200, { ok: true, stamp: incoming.stamp, swag });   // Round 109: + the account's swag (the union)
+    });
   }).catch(err => {
     console.error('players progress', err && err.message);
-    json(res, 500, { ok: false, error: 'try again' });
+    if (!res.headersSent) json(res, 500, { ok: false, error: 'try again' });   // Round 115 (accounts115): (never a second answer)
   });
 }
 
@@ -831,6 +1582,7 @@ function handle(req, res) {
   if (route === '/terms' || route === '/terms.html') { legal(res, 'terms'); return true; }
   if (route === '/privacy' || route === '/privacy.html') { legal(res, 'privacy'); return true; }
   if (route === '/admin/players') { admin(req, res); return true; }
+  if (require('./accountdelete').ROUTES.includes(route)) { require('./accountdelete').handle(req, res, deleteApi); return true; }   // Round 115 (launchA): the public "delete my account" page
   if (!route.startsWith('/players/')) return false;
 
   if (req.method === 'OPTIONS') {
@@ -854,6 +1606,7 @@ function handle(req, res) {
   if (route === '/players/progress') { progressRoute(req, res); return true; }   // Round 75 (its own body limit and GET + POST)
 
   if (route === '/players/ticket') { ticketRoute(req, res, ip); return true; }   // Round 109 (review L4)
+  if (route === '/players/blocks' && req.method === 'GET') { blocksRoute(req, res, {}); return true; }   // Round 115 (launchC)
 
   if (route === '/players/me') {
     const why = byBearerWhy(req);   // Round 111: a key that ran out -> 401 {signin, expired}
@@ -863,7 +1616,7 @@ function handle(req, res) {
     // Round 109: the game says what it is (the admin page's "last device"); a new device is worth an off-site backup soon.
     let device = '';
     try { device = new URL(req.url, 'http://x').searchParams.get('device') || ''; } catch { /* */ }
-    save(noteDevice(p, device) ? 60000 : false);
+    save(noteDevice(p, device) ? 60000 : false, p);   // Round 115 (accounts115): + which account
     json(res, 200, Object.assign({ ok: true, username: p.username, email: p.email, uid: p.uid, termsOk: !!(p.terms && p.terms.version === TERMS_VERSION), terms: TERMS_VERSION, required: required(), store: p.store ? p.store.id : '' }, sessionOf(p, why.hash)));   // Round 111: + when this key runs out
     return true;
   }
@@ -895,20 +1648,21 @@ async function route2(route, req, res, body, ip) {
       if (state.players[key]) return json(res, 409, { ok: false, field: 'username', message: `"${username}" is taken - try another username (or sign in if it's yours).` });
       const other = byEmail.get(email);
       if (other && state.players[other]) return json(res, 409, { ok: false, field: 'email', message: 'That email already has an account - sign in instead.' });
-      if (Object.keys(state.players).length >= MAX_PLAYERS) return json(res, 503, { ok: false, message: 'Sign-ups are full right now.' });
+      if (accountCount() >= MAX_PLAYERS) return json(res, 503, { ok: false, message: 'Sign-ups are full right now.' });   // Round 115 (accounts115): (counted once, not per sign-up)
       const pass = await hashPassword(body.password);
       if (state.players[key] || byEmail.get(email)) return json(res, 409, { ok: false, field: 'username', message: 'That was just taken - try again.' });
       // Round 109: + an immutable uid - this person, not this username (store accounts, worlds and merges go by it).
       const p = { uid: newUid(), username, email, pass, created: now(), updated: now(), seen: now(), terms: { version: TERMS_VERSION, at: now(), age13: true }, tokens: [] };
       noteDevice(p, body.device);   // Round 109
       state.players[key] = p;
+      countCache = -1;   // Round 115 (accounts115)
       byEmail.set(email, key);
       byUid.set(p.uid, key);   // Round 109
       const token = newToken(p);
       limited('up|' + ip, 20, 3600000);   // (only accounts actually made count)
       // Round 109 (review H1): the old tombstone for this name STAYS - it only ever matches the deleted person's records
       // (made before it), so nothing of theirs can come back into this new account from a backup.
-      save();
+      save(true, key);   // Round 115 (accounts115): + which account
       return json(res, 200, Object.assign({ ok: true, username, email, uid: p.uid }, issued(p, token)));   // Round 111: + expires, expiresIn, sessionDays
     }
 
@@ -929,7 +1683,7 @@ async function route2(route, req, res, body, ip) {
       if (!p || !okPass) return json(res, 401, { ok: false, field: 'password', message: `That username / email and password don't match. Forgot your password? Email ${CONTACT} and we'll reset it.` });
       const token = newToken(p);
       p.seen = now();
-      save(noteDevice(p, body.device) ? 60000 : false);   // Round 109: + the last device
+      save(noteDevice(p, body.device) ? 60000 : false, p);   // Round 109: + the last device. Round 115 (accounts115): + which account
       return json(res, 200, Object.assign({ ok: true, username: p.username, email: p.email, uid: p.uid, termsOk: !!(p.terms && p.terms.version === TERMS_VERSION) }, issued(p, token)));   // Round 111: + expires, expiresIn, sessionDays
     }
 
@@ -945,7 +1699,7 @@ async function route2(route, req, res, body, ip) {
       p.updated = now();
       dropTokens(p);   // signs out every other device
       const token = newToken(p);
-      save();
+      save(true, p);   // Round 115 (accounts115): + which account
       return json(res, 200, Object.assign({ ok: true }, issued(p, token)));   // Round 111: a fresh SESSION_DAYS from now
     }
 
@@ -957,7 +1711,7 @@ async function route2(route, req, res, body, ip) {
         const hash = sha('pt|' + token);
         p.tokens = (p.tokens || []).filter(t => t !== hash);
         byToken.delete(hash);
-        save(false);
+        save(false, p);   // Round 115 (accounts115): + which account
       }
       return json(res, 200, { ok: true });
     }
@@ -968,11 +1722,12 @@ async function route2(route, req, res, body, ip) {
       if (!p) return json(res, 401, signinReply(why));
       p.terms = { version: TERMS_VERSION, at: now(), age13: true };
       p.updated = now();
-      save();
+      save(true, p);   // Round 115 (accounts115): + which account
       return json(res, 200, { ok: true });
     }
 
     case '/players/store-link': return storeLink(req, res, body, ip);   // Round 109
+    case '/players/blocks': return blocksRoute(req, res, body);           // Round 115 (launchC)
 
     case '/players/delete': {
       const why = byBearerWhy(req);   // Round 111
@@ -1028,7 +1783,7 @@ function storeLink(req, res, body, ip) {
     p.storeOthers = others.slice(0, MAX_STORE_OTHERS);
     changed = true;
   }
-  if (changed) { p.updated = now(); save(); }
+  if (changed) { p.updated = now(); save(true, p); }   // Round 115 (accounts115): + which account
   const reply = Object.assign({}, out);
   delete reply.status;
   return json(res, 200, reply);
@@ -1062,10 +1817,66 @@ function ticketRoute(req, res, ip) {
   if (peek('ticket|' + p.uid, 60, 600000) || peek('ticketip|' + ip, 200, 600000)) { json(res, 429, { ok: false, message: 'Slow down a little.' }); return; }
   limited('ticket|' + p.uid, 60, 600000);
   limited('ticketip|' + ip, 200, 600000);
+  // Round 115 (launchC): a banned account - or one paused for an "under 13" report - gets no ticket (so it can't get into any
+  // room or the Open Festival); the game shows these words. A warning or a mute not yet seen rides along once (notice).
+  const M = moderation();
+  const refused = M ? M.refusal(p.uid) : '';
+  if (refused) { json(res, 403, { ok: false, banned: true, message: refused }); return; }
+  const notice = M ? M.takeNotice(p.uid) : '';
   const exp = (Date.now() + TICKET_MS).toString(36);
   const nonce = crypto.randomBytes(8).toString('hex');
   const ticket = `tk1-${p.uid}-${exp}-${nonce}-${ticketSig(p.uid, exp, nonce)}`;
-  json(res, 200, { ok: true, ticket, expires: Date.now() + TICKET_MS });
+  json(res, 200, Object.assign({ ok: true, ticket, expires: Date.now() + TICKET_MS }, notice ? { notice } : {}));   // Round 115 (launchC): + notice
+}
+
+// ------------------------------------------------------------------ Round 115 (launchC): moderation and blocks
+//
+// The admin's actions on an account (moderation.js: warn, mute, temporary / permanent ban, the "under 13" pause) are kept ON the
+// account (p.mod), so they ride along with the off-site backup and can't be lost with a restart. A player's block list is kept
+// on the account too (p.blocks: lower-case usernames, at most MAX_BLOCKS) - the same on every device they sign in on:
+//   GET  /players/blocks                 -> { ok, blocks: [names] }
+//   POST /players/blocks {name, on}      -> block / unblock one;  {add: [names]} -> add several (a device's own list, once)
+const MAX_BLOCKS = 200;
+function moderation() { try { return require('./moderation'); } catch { return null; } }
+function accountOfUid(uid) { const key = byUid.get(String(uid || '')); return key ? state.players[key] || null : null; }
+/** The admin's record on an account (a copy; {} when none), or null when there's no such account. */
+function modOf(uid) { const p = accountOfUid(uid); return p ? Object.assign({}, p.mod || {}) : null; }
+/** Replaces the admin's record on an account (saved and backed up soon). False when there's no such account. */
+function setMod(uid, mod) {
+  const p = accountOfUid(uid);
+  if (!p) return false;
+  p.mod = mod && typeof mod === 'object' ? mod : {};
+  p.updated = now();
+  save(true, p);   // Round 115 (accounts115): + which account
+  return true;
+}
+/** Who an account is, for the moderation page: { uid, username, created, seen } (never the email or password), or null. */
+function publicAccount(p) { return p ? { uid: p.uid, username: p.username, created: p.created || '', seen: p.seen || '' } : null; }
+function accountInfo(uid) { return publicAccount(accountOfUid(uid)); }
+function accountByName(name) { return publicAccount(state.players[cleanUsername(name).toLowerCase()] || null); }
+/** Every account the admin has acted on (p.mod set) - for the moderation page's "in force" list. */
+function moderated() { return Object.values(state.players).filter(p => p.mod && Object.keys(p.mod).length).map(p => Object.assign(publicAccount(p), { mod: Object.assign({}, p.mod) })); }
+/** The usernames (lower case) this account has blocked. */
+function blocksOf(uid) { const p = accountOfUid(uid); return p && Array.isArray(p.blocks) ? p.blocks.slice(0, MAX_BLOCKS) : []; }
+function blocksRoute(req, res, body) {
+  const why = byBearerWhy(req);
+  const p = why.p;
+  if (!p) return json(res, 401, signinReply(why));
+  if (!Array.isArray(p.blocks)) p.blocks = [];
+  if (req.method === 'POST') {
+    if (limited('blocks|' + p.uid, 120, 3600000)) return json(res, 429, { ok: false, message: 'Slow down a little.' });
+    const set = new Set(p.blocks);
+    const self = p.username.toLowerCase();
+    const add = Array.isArray(body.add) ? body.add.slice(0, MAX_BLOCKS) : [];
+    for (const n of add) { const k = cleanUsername(n).toLowerCase(); if (k.length >= 2 && k !== self && set.size < MAX_BLOCKS) set.add(k); }
+    if (typeof body.name === 'string') {
+      const k = cleanUsername(body.name).toLowerCase();
+      if (k.length >= 2 && k !== self) { if (body.on === false) set.delete(k); else if (set.size < MAX_BLOCKS) set.add(k); }
+    }
+    const next = Array.from(set);
+    if (next.join('\n') !== p.blocks.join('\n')) { p.blocks = next; p.updated = now(); save(true, p); }   // Round 115 (accounts115): + which account
+  }
+  return json(res, 200, { ok: true, blocks: p.blocks });
 }
 
 /** A connection ticket -> its account (used up here), or null (bad, used, expired, or the account is gone). */
@@ -1092,20 +1903,63 @@ function removeAccount(key) {
   if (!p) return false;
   const uid = uidOf(key, p);
   // Round 109: the store account stays (it holds purchases) - it just isn't this live account's any more.
-  if (p.store && p.store.id) { try { S().unlinkLive(uid, p.store.id); } catch (err) { console.error('players unlink', err && err.message); } }
+  // Round 115 (launchA): and the person's name and email come off it (and off any other store account seen with them); their
+  // real-shop listing goes (sellers.js).
+  const storeIds = [p.store && p.store.id].concat(Array.isArray(p.storeOthers) ? p.storeOthers.map(o => o && o.id) : []).filter(Boolean);
+  if (storeIds.length) { try { S().forgetLive(uid, storeIds, p.email); } catch (err) { console.error('players unlink', err && err.message); } }
+  try { require('./sellers').removeForAccount(p); } catch (err) { console.error('players sellers', err && err.message); }
   // Round 109 (review M1): their saved worlds are deleted with the account ("removed from our server straight away").
   try { require('./worlds').removeOwnedBy(uid); } catch (err) { console.error('players worlds', err && err.message); }
   dropTokens(p);
   byUid.delete(uid);   // (its tickets stop working at once)
   if (p.email && byEmail.get(p.email) === key) byEmail.delete(p.email);
   delete state.players[key];
+  countCache = -1;   // Round 115 (accounts115)
   state.deletedKeys = state.deletedKeys || {};
   state.deletedKeys[key] = now();   // (so no backup ever brings it back)
   state.deletedUids = state.deletedUids || {};
   state.deletedUids[uid] = now();   // Round 109: this person, forever (a new sign-up with the same name is someone else)
-  save();
+  // Round 115 (accounts115): the tombstones go into the journal; the saved game's file goes straight after they're safely there
+  // (and its pack in the GitHub backup is sent again without it).
+  tomb('dk', key, state.deletedKeys[key]);
+  tomb('du', uid, state.deletedUids[uid]);
+  pendingKeys.delete(key);
+  if (UID_RE.test(uid)) { saves.forget(uid); unlinkQueue.add(uid); markShard(uid); }
+  save(true, key);
   return true;
 }
+
+// ------------------------------------------------------------------ Round 115 (launchA): the public "delete my account" web page
+//
+// Google Play: an app with accounts must let people delete their account in the app (Settings > Online > Account > Delete
+// account - POST /players/delete) AND from a web page, without the game installed: GET/POST /account/delete (accountdelete.js
+// draws the page). Signing in there counts against the same limits as signing in from the game (per network and per login),
+// and the same wrong-password answer is given whether or not the account exists.
+const DUMMY_HASH = 's1$AAAAAAAAAAAAAAAAAAAAAA==$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=';
+
+/** -> {status, ok?, username?, message}: deletes the account <login> (username or email) if <password> is its password. */
+async function deleteByLogin(login, password, ip) {
+  if (!ready) return { status: 503, message: 'The server is starting up - try again in a few seconds.' };
+  const typed = String(login || '').trim();
+  if (!typed || typeof password !== 'string' || !password) return { status: 400, message: 'Type your username (or email) and your password.' };
+  if (peek('in|' + ip, 50, 3600000)) return { status: 429, message: 'Too many wrong tries from this network - wait a while and try again.' };
+  const tried = typed.toLowerCase().slice(0, 120);
+  if (peek('acct|' + tried + '|' + ip, 10, 3600000)) return { status: 429, message: `Too many wrong passwords - wait an hour, or email ${CONTACT} from your account's email address.` };
+  const key = typed.includes('@') ? byEmail.get(cleanEmail(typed)) : cleanUsername(typed).toLowerCase();
+  const p = key ? state.players[key] : null;
+  const okPass = p ? await checkPassword(password, p.pass) : await checkPassword(password, DUMMY_HASH);   // (same time either way)
+  if (!p || !okPass) {
+    limited('in|' + ip, 50, 3600000);
+    limited('acct|' + tried + '|' + ip, 10, 3600000);
+    return { status: 401, message: `That username / email and password don't match. Forgot your password? Email ${CONTACT} from your account's email address and we'll delete it for you.` };
+  }
+  const username = p.username;
+  if (state.players[key] === p) removeAccount(key);   // (gone already - deleted from another device a moment ago - is fine too)
+  console.log('players: an account was deleted from the web page');
+  return { status: 200, ok: true, username };
+}
+
+const deleteApi = { deleteByLogin, ipOf, contact: CONTACT, company: COMPANY, style: () => LEGAL_STYLE, esc: s => esc0(s), isReady: () => ready };
 
 // ------------------------------------------------------------------ admin
 
@@ -1114,14 +1968,15 @@ function admin(req, res) {
   const esc = (s) => pay.escapeHtml(s);
 
   const show = (key, q, note) => {
-    const all = Object.values(state.players).sort((a, b) => String(b.created).localeCompare(String(a.created)));
+    // Round 115 (accounts115): a plain comparison (the dates are ISO text) - localeCompare took most of a second at 50,000 accounts
+    const all = Object.values(state.players).filter(p => p && typeof p === 'object').map(p => [String(p.created || ''), p]).sort((a, b) => (a[0] < b[0] ? 1 : a[0] > b[0] ? -1 : 0)).map(x => x[1]);
     const term = String(q || '').trim().toLowerCase();
     const list = term ? all.filter(p => p.username.toLowerCase().includes(term) || String(p.email).includes(term) || (p.store && String(p.store.id).toLowerCase() === term)) : all;   // Round 109: + a store account id
     const hidden = require('./adminauth').hidden(key);   // Round 110: the session's CSRF token (key = that token now)
     const rows = list.slice(0, 500).map(p => {
       const k = esc(p.username.toLowerCase());
       return `<tr><td><b>${esc(p.username)}</b><br><span class="small">${esc(p.email)}</span></td>
-<td class="small">joined ${esc(String(p.created).slice(0, 10))}<br>last seen ${esc(String(p.seen || '').slice(0, 10))}<br>terms ${esc(p.terms ? p.terms.version : 'not yet')}<br>${p.progress && p.progress.stamp ? `synced ${esc(ago(p.progress.at))}${p.progress.role ? ' &middot; ' + esc(p.progress.role) : ''}` : 'no saved game yet'}</td>
+<td class="small">joined ${esc(String(p.created).slice(0, 10))}<br>last seen ${esc(String(p.seen || '').slice(0, 10))}<br>terms ${esc(p.terms ? p.terms.version : 'not yet')}<br>${(pm => pm && pm.stamp ? `synced ${esc(ago(pm.at))}${pm.role ? ' &middot; ' + esc(pm.role) : ''}` : 'no saved game yet')(pmOf(p))}</td>
 <td class="small">${storeCell(p, esc)}<br>${p.device && p.device.name ? `last device: ${esc(p.device.name)} &middot; ${esc(ago(p.device.at))}` : 'last device: not known yet'}</td>
 <td><form method="post" action="/admin/players" onsubmit="return confirm('Give ${k} a new password? (Tell them by email.)')">${hidden}<input type="hidden" name="action" value="reset"><input type="hidden" name="who" value="${k}"><button type="submit">New password</button></form>
 <form method="post" action="/admin/players" onsubmit="return confirm('DELETE the account ${k}? This cannot be undone.')">${hidden}<input type="hidden" name="action" value="delete"><input type="hidden" name="who" value="${k}"><button type="submit" style="background:#ff8a80">Delete</button></form></td></tr>`;
@@ -1129,7 +1984,7 @@ function admin(req, res) {
 
     const disk = persistent() ? '<span class="on">Safe disk: ON</span> (STORE_DATA_DIR)' : '<span class="off">Safe disk: OFF</span> - without a disk (or the GitHub backup below), a redeploy forgets every account.';
     const gh = vault.on
-      ? (vault.loaded && !vault.error ? `<span class="on">GitHub backup: ON</span> (${esc(VAULT_REPO)})${vault.pushedAt ? ' - last saved ' + esc(vault.pushedAt.replace('T', ' ').slice(0, 16)) + ' UTC' : ''}` : `<span class="off">GitHub backup: PROBLEM</span> - ${esc(vault.error || 'not reachable yet')}`)
+      ? (vault.loaded && !vault.error ? `<span class="on">GitHub backup: ON</span> (${esc(VAULT_REPO)}, branch ${esc(VAULT_BRANCH)})${vault.pushedAt ? ' - last saved ' + esc(vault.pushedAt.replace('T', ' ').slice(0, 16)) + ' UTC' : ''}${vault.dirtyShards.size ? ` - ${vault.dirtyShards.size} saved-game packs still to send` : ''}` : `<span class="off">GitHub backup: PROBLEM</span> - ${esc(vault.error || 'not reachable yet')}`)
       : '<span class="off">GitHub backup: OFF</span> (set BACKUP_GITHUB_REPO and BACKUP_GITHUB_TOKEN - see README.txt "LIVE ACCOUNTS")';
     const safe = persistent() || (vault.on && vault.loaded && !vault.error);
 
@@ -1139,7 +1994,7 @@ ${loadNote ? `<p class="small">${esc(loadNote)}</p>` : ''}
 <p><b>${all.length}</b> accounts (username + email + password) for the Open Festival.${required() ? '' : ' <span class="off">Accounts are switched OFF (LIVE_SIGNUP_REQUIRED=0).</span>'}</p>
 <p class="small">${disk}<br>${gh}</p>
 ${safe ? '' : '<p class="off">Accounts are NOT safe from a redeploy yet. Turn on the disk or the GitHub backup (README.txt "LIVE ACCOUNTS"), and download a full backup now.</p>'}
-<p class="small">Passwords are stored scrambled (salted scrypt) - nobody can read them, including you. If a player forgets theirs, press "New password" and email them the new one; they can change it in the game (Settings &gt; Game &gt; Live account).</p>
+<p class="small">Passwords are stored scrambled (salted scrypt) - nobody can read them, including you. If a player forgets theirs, press "New password" and email them the new one; they can change it in the game (Settings &gt; Online &gt; Account &gt; Change password).</p>
 <form method="post" action="/admin/players">${hidden}<input name="q" value="${esc(q || '')}" placeholder="search username, email or store id"> <button type="submit">Search</button></form>
 <form method="post" action="/admin/players" style="display:inline">${hidden}<input type="hidden" name="action" value="csv"><button type="submit">Download usernames + emails (CSV)</button></form>
 <form method="post" action="/admin/players" style="display:inline">${hidden}<input type="hidden" name="action" value="backup"><button type="submit">Download full backup</button></form>
@@ -1154,7 +2009,7 @@ ${list.length > 500 ? `<p class="small">Showing the newest 500 of ${list.length}
     if (!g) return;
     const form = g.form, key = g.token;
 
-    if (!ready) { pay.page(res, 503, 'Live accounts', '<h1>Live accounts</h1><p>The server is still loading the accounts - refresh in a few seconds.</p>'); return; }
+    if (!ready) { pay.page(res, 503, 'Live accounts', `<h1>Live accounts</h1><p>The server is still loading the accounts - refresh in a few seconds.</p>${loadNote ? `<p class="small">${esc(loadNote)}</p>` : ''}`); return; }   // Round 115 (accounts115): + the note (a migration / rollback)
     const action = form.get('action') || '';
     const stamp = new Date().toISOString().slice(0, 10);
 
@@ -1162,18 +2017,40 @@ ${list.length > 500 ? `<p class="small">Showing the newest 500 of ${list.length}
       // Round 109 (review L3): a cell a spreadsheet could read as a formula (= + - @, tab, CR) gets a ' in front.
       const q = (s) => { let v = String(s || ''); if (/^[=+\-@\t\r]/.test(v)) v = "'" + v; return '"' + v.replace(/"/g, '""') + '"'; };
       // Round 109: + the linked store account and the last device
-      const lines = ['username,email,created,last_seen,terms_version,terms_agreed,last_sync,role,store_account,last_device,last_device_at'].concat(Object.values(state.players).map(p =>
-        [p.username, p.email, p.created, p.seen, p.terms && p.terms.version, p.terms && p.terms.at, p.progress && p.progress.stamp ? p.progress.at : '', p.progress ? p.progress.role : '',
-          p.store ? p.store.id : '', p.device ? p.device.name : '', p.device ? p.device.at : ''].map(q).join(',')));
+      // Round 115 (accounts115): written in slices of 2,000 rows (50,000 accounts never hold the server up); the saved game's
+      // time and role come from the index ("pm")
       res.writeHead(200, { 'content-type': 'text/csv; charset=utf-8', 'content-disposition': `attachment; filename="live-accounts-${stamp}.csv"`, 'cache-control': 'no-store' });
-      res.end(lines.join('\n'));
+      res.write('username,email,created,last_seen,terms_version,terms_agreed,last_sync,role,store_account,last_device,last_device_at');
+      const keys = Object.keys(state.players);
+      for (let i = 0; i < keys.length; i += 2000) {
+        const rows = [];
+        for (const k of keys.slice(i, i + 2000)) {
+          const p = state.players[k];
+          if (!p || typeof p !== 'object') continue;
+          const pm = pmOf(p);
+          rows.push([p.username, p.email, p.created, p.seen, p.terms && p.terms.version, p.terms && p.terms.at, pm && pm.stamp ? pm.at : '', pm ? pm.role : '',
+            p.store ? p.store.id : '', p.device ? p.device.name : '', p.device ? p.device.at : ''].map(q).join(','));
+        }
+        if (rows.length && !res.write('\n' + rows.join('\n'))) await new Promise(r => { res.once('drain', r); res.once('close', r); });
+        if (res.destroyed) return;
+        await AS.nextTick();
+      }
+      res.end();
       return;
     }
 
     if (action === 'backup') {
-      flush();
+      // Round 115 (accounts115): every account WITH its saved game, in the same format as always (Restore takes it; so does the
+      // old players.js) - streamed account by account from the index and the saved-game files, never all in memory at once.
+      await persist();
       res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'content-disposition': `attachment; filename="live-accounts-backup-${stamp}.json"`, 'cache-control': 'no-store' });
-      res.end(JSON.stringify(Object.assign({ kind: 'nmsd-live-accounts' }, state)));
+      try {
+        await exportFull(async (text) => {
+          if (res.destroyed) throw new Error('the download was stopped');
+          if (!res.write(text)) await new Promise(r => { res.once('drain', r); res.once('close', r); });
+        });
+      } catch (err) { console.error('players backup download', err && err.message); res.destroy(); return; }
+      res.end();
       return;
     }
 
@@ -1191,7 +2068,7 @@ ${list.length > 500 ? `<p class="small">Showing the newest 500 of ${list.length}
         p.pass = await hashPassword(temp);
         p.updated = now();
         dropTokens(p);
-        save();
+        save(true, p);   // Round 115 (accounts115): + which account
         note = `New password for <b>${esc(p.username)}</b> (${esc(p.email)}): <b>${esc(temp)}</b><br>Email it to them now - it isn't shown again. They can change it in the game.`;
       }
     } else if (action === 'delete') {
@@ -1219,7 +2096,7 @@ function storeCell(p, esc) {
 
 /** For the main /admin page: one line and the way in. */
 function adminSection(hiddenKey) {
-  const n = Object.keys(state.players).length;
+  const n = accountCount();   // Round 115 (accounts115)
   const safe = persistent() || (vault.on && vault.loaded && !vault.error);
   return `<h2>Live accounts</h2><p class="small">${n} player accounts for the Open Festival${required() ? '' : ' (switched OFF - LIVE_SIGNUP_REQUIRED=0)'}${safe ? '' : ' · <span class="off">NOT backed up - see the accounts page</span>'}</p>
 <form method="post" action="/admin/players">${hiddenKey}<button type="submit">Open live accounts</button></form>`;
@@ -1238,6 +2115,9 @@ function legal(res, which) {
   res.end(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title><style>${LEGAL_STYLE}</style></head><body><main>${body}</main></body></html>`);
 }
 
+// Round 115 (launchA): factual fixes only - the in-game delete path (Settings > Online > Account > Delete account) and a link to
+// the public /account/delete page, in the Terms (section 3) and the Privacy Policy's live-accounts part; section 5: reports keep
+// the reported player's last chat lines (launchC's moderation.js / safety.js). TERMS_VERSION unchanged.
 function termsHtml() {
   return `<h1>Terms of Service</h1>
 <p>New Moon, Same Dark · ${COMPANY} · Effective ${TERMS_VERSION}</p>
@@ -1253,13 +2133,13 @@ function termsHtml() {
 <ul><li>Give a real email address you control, pick a username that isn't offensive, misleading or someone else's name or trademark, and keep your password secret. One account per person, and you may not sell, share or transfer it.</li>
 <li>You're responsible for everything done with your account. Tell us straight away at ${esc0(CONTACT)} if you think someone else is using it.</li>
 <li>We may change a username that breaks these Terms, and we may suspend or close accounts as described in section 7.</li>
-<li>You can delete your account at any time in the game (Settings &gt; Game &gt; Live account) or by emailing us.</li></ul>
+<li>You can delete your account at any time in the game (Settings &gt; Online &gt; Account &gt; Delete account), on our <a href="/account/delete">account deletion page</a>, or by emailing us.</li></ul>
 
 <h2>4. Rules for playing with others</h2>
 <p>You agree not to: harass, threaten, bully, stalk or impersonate anyone; post or say anything hateful, sexually explicit, violent, illegal or that shares someone's private information; cheat, use bots, exploits, mods or hacks that give an unfair advantage or disrupt others; attack, overload, reverse-engineer or try to get unauthorized access to our servers or other players' accounts; spam, advertise or scam; or use the Services for anything illegal. Players can report others in the game; we review reports and may act on them.</p>
 
 <h2>5. What you create and share</h2>
-<p>Things you make or share through the Services (names, chat, voice, festival designs, booths, photos, artist applications and other content) stay yours, but you give us a worldwide, non-exclusive, royalty-free licence to host, store, copy, show, share with other players and adapt them as needed to run, improve and promote the Game. You promise you have the right to share them and that they don't break these Terms or anyone else's rights. We may remove any content at any time. Voice and chat are passed between players live and are not recorded by us.</p>
+<p>Things you make or share through the Services (names, chat, voice, festival designs, booths, photos, artist applications and other content) stay yours, but you give us a worldwide, non-exclusive, royalty-free licence to host, store, copy, show, share with other players and adapt them as needed to run, improve and promote the Game. You promise you have the right to share them and that they don't break these Terms or anyone else's rights. We may remove any content at any time. Voice and chat are passed between players live and are not recorded by us, except that a report keeps the reported player's last few chat lines and a line our word filter blocks is kept for review (see the Privacy Policy).</p>
 
 <h2>6. Virtual items and purchases</h2>
 <p>Moon Shards, tokens, Festival Pass levels, unlocks, legendary items and other virtual items are a limited, personal, revocable licence to use them in the Game. They have no real-world or cash value, can't be exchanged for money, and can't be sold or transferred outside the Game. Purchases are handled by Stripe, Steam, Google Play or the App Store under their terms; all sales are final except where the law (or that store's own refund policy) says otherwise. We may change, rebalance or retire virtual items and features.</p>
@@ -1296,7 +2176,7 @@ function privacyHtml() {
     if (m) main = m[1];
   } catch { /* */ }
   const live = `<h2>Live accounts (the Open Festival)</h2>
-  <p>To play live you make a live account: a <strong>username</strong> (shown to other players), your <strong>email address</strong> (never shown to other players; used to identify your account, to help you if you lose access, and for important notices about the Game or these policies) and a <strong>password</strong> (we only keep a scrambled one-way version - nobody, including us, can read it). We also keep when you made the account, when you last played, the kind of device you last played on (just the platform and the game's version, like "Android 1.4"), your character and what you've unlocked (so they follow you to any device), and that you agreed to the Terms of Service and confirmed you're 13 or older. Your device keeps a sign-in key so you don't have to type your password each time. We keep backups of accounts (encrypted where they're stored off our server) so an update never loses them. You can delete your account in the game (Settings &gt; Game &gt; Live account) or by emailing us; it's removed from our server straight away; older encrypted backup copies are kept only to protect everyone's accounts, are never used to bring a deleted account back, and are replaced over time.</p>
+  <p>To play live you make a live account: a <strong>username</strong> (shown to other players), your <strong>email address</strong> (never shown to other players; used to identify your account, to help you if you lose access, and for important notices about the Game or these policies) and a <strong>password</strong> (we only keep a scrambled one-way version - nobody, including us, can read it). We also keep when you made the account, when you last played, the kind of device you last played on (just the platform and the game's version, like "Android 1.4"), your character and what you've unlocked (so they follow you to any device), and that you agreed to the Terms of Service and confirmed you're 13 or older. Your device keeps a sign-in key so you don't have to type your password each time. We keep backups of accounts (encrypted where they're stored off our server) so an update never loses them. You can delete your account in the game (Settings &gt; Online &gt; Account &gt; Delete account), on our <a href="/account/delete">account deletion page</a> (no game needed), or by emailing us; it's removed from our server straight away; older encrypted backup copies are kept only to protect everyone's accounts, are never used to bring a deleted account back, and are replaced over time.</p>
   <p>We never sell your information or use your email for advertising. We may email you about your account or important changes; we'll only send newsletters if you ask for them.</p>`;
   if (!main) {
     return `<h1>Privacy Policy</h1><p>${COMPANY}</p>${live}<h2>Contact</h2><p>${COMPANY} · ${esc0(CONTACT)}</p>`;
@@ -1331,4 +2211,8 @@ function gate(req, body, what) {
   return { ok: true, account: p.uid, username: p.username.toLowerCase() };   // Round 109: the account's uid (worlds go by it)
 }
 
-module.exports = { handle, check, checkWhy, required, isReady, gate, redeemTicket, isTicket, graceActive, uidOf, flush, final, adminSection, TERMS_VERSION, SESSION_DAYS, vaultKeyOk, vaultOn: () => vault.on, _test: { state: () => state, cleanUsername, validEmail, passwordProblem, seal, unseal, merge, cleanSwag, unionSwag, pickProgress, cleanDevice, legacyUid, pruneTokens, tokenLive, SESSION_MS } };
+module.exports = { handle, check, checkWhy, required, isReady, gate, redeemTicket, isTicket, graceActive, uidOf, flush, final, adminSection, TERMS_VERSION, SESSION_DAYS, vaultKeyOk, vaultOn: () => vault.on,
+  modOf, setMod, accountInfo, accountByName, moderated, blocksOf, removeAccountByUid: uid => { const p = accountOfUid(uid); return p ? removeAccount(p.username.toLowerCase()) : false; },   // Round 115 (launchC)
+  _test: { state: () => state, cleanUsername, validEmail, passwordProblem, seal, unseal, merge, cleanSwag, unionSwag, pickProgress, cleanDevice, legacyUid, pruneTokens, tokenLive, SESSION_MS,
+    // Round 115 (accounts115): the storage, for the tests (r115acct.test.js)
+    persist, compactAll: () => { fullDirty = true; return persist({ force: true }); }, saves, journal, accountCount, exportFull, loadProgress, storage: () => ({ snapBytes, snapGen, journalBytes: journal.bytes, journalGen: journal.gen, pending: pendingKeys.size, dirty: dirtyKeys.size, cache: saves.stats(), vault: { head: vault.head, chain: vault.chain, shards: Object.keys(vault.shards).length, dirtyShards: vault.dirtyShards.size, error: vault.error, pushedAt: vault.pushedAt } }) } };

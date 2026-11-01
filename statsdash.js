@@ -9,7 +9,7 @@
 //
 //   GET /admin/stats?days=30|90                         the page (signed-in admin session - adminauth.js)
 //   GET /admin/stats/export?section=<id>&format=csv|json&days=30|90   one section's numbers as a file
-//       sections: now, growth, retention, engagement, versions, accounts, features, money, health
+//       sections: now, growth, funnel (Round 115), retention, engagement, versions, accounts, features, money, health
 
 const ui = require('./adminui');
 const auth = require('./adminauth');
@@ -22,7 +22,7 @@ const dayKey = ms => new Date(ms).toISOString().slice(0, 10);
 const { esc, fmt, fmt1, pct, money, minutesText, tile, hbars, lineChart, barChart, shareChart, SERIES, GRAY } = ui;
 
 const SECTIONS = [
-  ['now', 'Right now'], ['growth', 'Growth'], ['retention', 'Retention'], ['engagement', 'Engagement'], ['versions', 'Versions'],
+  ['now', 'Right now'], ['growth', 'Growth'], ['funnel', 'Funnel'], ['retention', 'Retention'], ['engagement', 'Engagement'], ['versions', 'Versions'],   // Round 115 (launchC): + Funnel
   ['accounts', 'Accounts'], ['features', 'Features'], ['money', 'Money'], ['health', 'Health']
 ];
 const GRACE_BUILD = 109;   // the first build with live accounts (the grace period lets older ones into rooms)
@@ -206,7 +206,8 @@ function compute(range) {
     money, health: { healthRange, healthByDay, errorsByDay, errByVersion, errByPlat, topErrors, crashed, errorKinds: errs.length },
     rooms: { rmA, rmG, rmDays, rm7 },
     online: v.online, relay: v.relay, liveMap: v.live, ONLINE_MS: v.ONLINE_MS, persistent: v.PERSISTENT, loadNote: v.loadNote, since: state.since,
-    funnel: funnelOf(state, v.FUNNEL)
+    funnel: funnelOf(state, v.FUNNEL),
+    firstSession: firstSessionOf(state, v, first, today)   // Round 115 (launchC)
   };
   cache = { at: now, range, rev: v.rev, data };
   return data;
@@ -215,6 +216,31 @@ function compute(range) {
 function funnelOf(state, FUNNEL) {
   const out = FUNNEL.map(([k, label]) => [k, label, 0]);
   for (const p of Object.values(state.installs)) for (const row of out) if (p.fl && p.fl[row[0]]) row[2]++;
+  return out;
+}
+
+/**
+ * Round 115 (launchC): THE FIRST-SESSION FUNNEL - the new players of the range whose game reports the funnel (build 115 on: it
+ * sent first_launch), how many reached each step (analytics.js p.fn, once per install), which title door they took, and how
+ * many came back the next day (D1) and a week later (D7) - worked out here from each install's own days played.
+ */
+function firstSessionOf(state, v, first, today) {
+  const steps = v.FUNNEL_STEPS || [];
+  const out = { size: 0, steps: steps.map(([k, label]) => ({ k, label, n: 0 })), doors: { demo: 0, live: 0, career: 0 }, d1: { size: 0, kept: 0 }, d7: { size: 0, kept: 0 },
+    firstSec: 0, firstN: 0, sessions: state.se || { n: 0, sec: 0, b: [0, 0, 0, 0, 0, 0] }, buckets: v.SESSION_BUCKETS || [] };
+  for (const p of Object.values(state.installs)) {
+    const fn = p.fn;
+    if (!fn || !fn.first_launch) continue;
+    const f = dayIndex(p.f);
+    if (f < first || f > today) continue;
+    out.size++;
+    for (const st of out.steps) if (fn[st.k]) st.n++;
+    for (const d of Object.keys(out.doors)) if (fn['door_' + d]) out.doors[d]++;
+    const ad = p.ad || [];
+    if (f + 1 < today) { out.d1.size++; if (ad.includes(f + 1)) out.d1.kept++; }
+    if (f + 7 < today) { out.d7.size++; if (ad.includes(f + 7)) out.d7.kept++; }
+    if (p.fs1) { out.firstSec += p.fs1; out.firstN++; }
+  }
   return out;
 }
 
@@ -323,6 +349,37 @@ ${tile(pct(stick), 'stickiness (DAU ÷ MAU)', 'how many monthly players come dai
       series: [{ name: 'New installs', color: SERIES[0], values: c.fresh }, { name: 'New accounts', color: SERIES[1], values: c.signups }] });
     b += '</div>';
     parts.push(card('growth', 'Growth', 'A "player" is one copy of the game on one device. DAU / WAU / MAU = players who played on the day / in the last 7 / in the last 30 days.', b, days));
+  }
+
+  // ---------------------------------------------------------------- Round 115 (launchC): Funnel
+  {
+    const F = c.firstSession;
+    const step = k => F.steps.find(s => s.k === k) || { n: 0, label: k };
+    const rate = (n, of) => (of ? pct(n / of) : '–');
+    const d1 = F.d1.size ? F.d1.kept / F.d1.size : null, d7 = F.d7.size ? F.d7.kept / F.d7.size : null;
+    let b = `<div class="tiles">${tile(fmt(F.size), `new players (${c.range} days)`, 'whose game reports the funnel (build 115 on)')}${tile(rate(step('title_door').n, F.size), 'tapped a door on the title')}
+${tile(pct(d1), 'came back next day (D1)', `${fmt(F.d1.kept)} of ${fmt(F.d1.size)}`)}${tile(pct(d7), 'came back a week later (D7)', `${fmt(F.d7.kept)} of ${fmt(F.d7.size)}`)}
+${tile(F.firstN ? minutesText(F.firstSec / F.firstN / 60) : '–', 'first session, average')}</div>`;
+    if (!F.size) b += '<p class="empty">No new players from build 115 on in this range yet.</p>';
+    else {
+      const path = (title, sub, keys, door, color) => {
+        const doorN = F.doors[door] || 0;
+        const rows = [['Tapped ' + door.toUpperCase() + ' on the title', doorN, rate(doorN, F.size) + ' of new players']];
+        let prev = doorN;
+        for (const k of keys) { const s = step(k); rows.push([s.label.replace(/^(Demo|Live|Career): /, ''), s.n, rate(s.n, prev) + ' of the step before']); prev = s.n; }
+        return ui.chartBox({ title, sub }, hbars(rows, { max: Math.max(doorN, 1), color, limit: 10 }));
+      };
+      b += '<div class="charts">';
+      b += path('Demo', 'title > PLAY DEMO > first activity', ['demo_start', 'first_activity'], 'demo', 'var(--s1)');
+      b += path('Live', 'title > JOIN LIVE > sign up > character > Open Festival > a first role job', ['signup_view', 'signup_done', 'character_done', 'live_join', 'first_job_done'], 'live', 'var(--s2)');
+      b += path('Career', 'title > career > a first festival finished', ['career_start', 'first_festival_done'], 'career', 'var(--s3)');
+      const se = F.sessions, labels = ['under 1 min', '1-3 min', '3-10 min', '10-30 min', '30-60 min', 'over an hour'];
+      b += ui.chartBox({ title: 'How long sessions last (all time)', sub: se.n ? `${fmt(se.n)} sessions, average ${minutesText(se.sec / se.n / 60)}` : 'no sessions reported yet' },
+        hbars(labels.map((l, i) => [l, se.b[i] || 0, se.n ? pct((se.b[i] || 0) / se.n) : '']), { max: Math.max(1, ...se.b), color: 'var(--s4)' }));
+      b += '</div>';
+      b += `<h3>Every step (share of the ${fmt(F.size)} new players)</h3>${hbars(F.steps.map(s => [s.label, s.n, rate(s.n, F.size)]), { max: Math.max(F.size, 1), color: 'var(--s2)', limit: 12 })}`;
+    }
+    parts.push(card('funnel', 'Funnel', 'The first ten minutes: of the new players in this range, how many reached each step - and did they come back? Each step counts once per player. No names or accounts: only which step, which door, how long.', b, days));
   }
 
   // ---------------------------------------------------------------- Retention
@@ -492,6 +549,13 @@ function rowsFor(section, c) {
       return rows;
     }
     case 'growth': return daily([['dau', c.dau], ['wau', c.wau], ['mau', c.mau], ['new_installs', c.fresh], ['new_accounts', c.signups]]);
+    case 'funnel': {   // Round 115 (launchC)
+      const F = c.firstSession;
+      return [['step', 'label', 'players', 'share_of_new']].concat(F.steps.map(s => [s.k, s.label, s.n, F.size ? (s.n / F.size).toFixed(4) : '']))
+        .concat([[], ['door', 'players']], Object.entries(F.doors).map(([k, n]) => [k, n]),
+          [[], ['measure', 'value'], ['new_players', F.size], ['d1_players', F.d1.size], ['d1_back', F.d1.kept], ['d7_players', F.d7.size], ['d7_back', F.d7.kept],
+            ['first_session_avg_seconds', F.firstN ? Math.round(F.firstSec / F.firstN) : ''], ['sessions_reported', F.sessions.n], ['session_avg_seconds', F.sessions.n ? Math.round(F.sessions.sec / F.sessions.n) : '']]);
+    }
     case 'retention': {
       const today = dayIndex(c.now);
       const v = (first, off, kept, size) => first + off >= today || !size ? '' : (kept / size).toFixed(4);

@@ -22,7 +22,9 @@ const ICONS = {
   apps: '<rect x="5" y="3.5" width="14" height="17" rx="2"/><path d="M9 8.5h6M9 12h6M9 15.5h3.5"/>',
   sellers: '<path d="M3.5 9.5 5 4.5h14l1.5 5"/><path d="M4.5 9.5V20h15V9.5"/><path d="M3.5 9.5a2.8 2.8 0 0 0 5.6 0 2.9 2.9 0 0 0 5.8 0 2.8 2.8 0 0 0 5.6 0"/><path d="M10 20v-5h4v5"/>',
   patch: '<circle cx="12" cy="12" r="8.5"/><circle cx="12" cy="12" r="2.5"/><path d="M12 3.5v3M20.5 12h-3"/>',
-  devcheck: '<rect x="6.5" y="2.5" width="11" height="19" rx="2"/><path d="M10.5 18.5h3"/><path d="m9.5 10 2 2 3.5-4"/>'
+  devcheck: '<rect x="6.5" y="2.5" width="11" height="19" rx="2"/><path d="M10.5 18.5h3"/><path d="m9.5 10 2 2 3.5-4"/>',
+  moderation: '<path d="M12 2.8 4.5 6v5.5c0 4.6 3.1 8.3 7.5 9.7 4.4-1.4 7.5-5.1 7.5-9.7V6z"/><path d="M12 8v4.5M12 15.8v.2"/>',   // Round 115 (launchC)
+  liveops: '<path d="M2.5 12h4l2.5-6 4 12 2.5-6h6"/>'   // Round 115 (launchB)
 };
 const icon = k => `<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[k]}</svg>`;
 
@@ -76,7 +78,8 @@ function numbers() {
   const djs = pb ? Object.keys(pb.djs || {}).length : 0;
   const sets = pb && Array.isArray(pb.slots) ? pb.slots.filter(s => s.state !== 'done').length : 0;
   const dc = safe(() => require('./devcheck').summary(), { count: 0, newest: '', problems: 0 });   // Round 112
-  return { stats, dash, accounts: accounts.length, newAccounts, appsWaiting, appsAll, shopsWaiting, shopsLive, djs, sets, dc };
+  const mod = safe(() => require('./moderation').summary(), { open: 0, players: 0, u13: 0, newest: '' });   // Round 115 (launchC)
+  return { stats, dash, accounts: accounts.length, newAccounts, appsWaiting, appsAll, shopsWaiting, shopsLive, djs, sets, dc, mod };
 }
 
 /**
@@ -113,16 +116,24 @@ function render(req, res, token) {
   const d = n.dash;
   const m = d ? d.money : null;
   const grace = d ? safe(() => require('./statsdash')._test.graceInfo(d), null) : null;
+  // Round 115 (launchB): the server right now - players online, rooms, memory and lag (live ops: switches, maintenance, cap).
+  const lo = safe(() => require('./liveops').tile(), null);
   const tiles = [
+    ...(lo ? [['/admin/liveops', 'liveops', 'Live ops', fmt(lo.players), 'playing online now', `${fmt(lo.publicPlayers)}/${fmt(lo.publicCap)} Open Festival · ${fmt(lo.rooms)} rooms · memory ${fmt(lo.rssMB)}/${fmt(lo.memLimitMB)} MB · lag ${lo.lagP99Ms} ms · ${lo.maintenance ? 'MAINTENANCE ON' : lo.level}`]] : []),
     ['/admin/stats', 'stats', 'Play stats', fmt(n.stats.online), 'playing right now', `${fmt(n.stats.dau)} today · ${fmt(n.stats.fresh)} new today · ${fmt(n.stats.total)} ever`],
     ['/admin/players', 'players', 'Players', fmt(n.accounts), 'live accounts', `${fmt(n.newAccounts)} new this week · look up, reset or delete one`],
     ['/admin/store', 'store', 'Store & payments', m ? money(m.centsRange) : '$0.00', 'sales in the last 30 days', m ? `${fmt(m.salesRange)} purchases · store ${m.open ? 'ON' : 'OFF'}${m.refunds ? ` · ${fmt(m.refunds)} refunds` : ''}` : ''],
     ['/admin/applications', 'apps', 'Applications', fmt(n.appsWaiting), 'artists waiting for you', `${fmt(n.appsAll)} applications in all`],
     ['/admin/sellers', 'sellers', 'Sellers', fmt(n.shopsWaiting), 'shops waiting for review', `${fmt(n.shopsLive)} live shops`],
     ['/admin/patch', 'patch', 'Patch bay', fmt(n.djs), 'DJs on the roster', `${fmt(n.sets)} set${n.sets === 1 ? '' : 's'} scheduled`],
-    ['/admin/devcheck', 'devcheck', 'Device checks', fmt(n.dc.count), 'reports from players\' devices', n.dc.newest ? `newest ${n.dc.newest.slice(0, 16).replace('T', ' ')} UTC · ${fmt(n.dc.problems)} problems` : 'Settings > Device check in the game']
+    ['/admin/devcheck', 'devcheck', 'Device checks', fmt(n.dc.count), 'reports from players\' devices', n.dc.newest ? `newest ${n.dc.newest.slice(0, 16).replace('T', ' ')} UTC · ${fmt(n.dc.problems)} problems` : 'Settings > Device check in the game'],
+    ['/admin/moderation', 'moderation', 'Moderation', fmt(n.mod.open), 'open player reports', `${fmt(n.mod.players)} player${n.mod.players === 1 ? '' : 's'} reported${n.mod.u13 ? ` · ${fmt(n.mod.u13)} paused (under 13)` : ''} · warn, mute, ban`]   // Round 115 (launchC)
   ];
   const todo = [];
+  if (lo && lo.maintenance) todo.push(['warn', 'Maintenance mode is ON - nobody new can join', '/admin/liveops', 'Live ops']);   // Round 115 (launchB)
+  if (lo && lo.level !== 'ok') todo.push([lo.level === 'busy' ? 'warn' : 'bad', `The server is ${lo.level} (memory ${fmt(lo.rssMB)} MB, lag ${lo.lagP99Ms} ms)`, '/admin/liveops', 'See']);   // Round 115 (launchB)
+  if (n.mod.u13) todo.push(['bad', `${fmt(n.mod.u13)} account${n.mod.u13 === 1 ? '' : 's'} paused after an "under 13" report - check ${n.mod.u13 === 1 ? 'it' : 'them'}`, '/admin/moderation', 'Review']);   // Round 115 (launchC)
+  if (n.mod.open) todo.push(['warn', `${fmt(n.mod.open)} player report${n.mod.open === 1 ? '' : 's'} waiting`, '/admin/moderation', 'Review']);   // Round 115 (launchC)
   if (n.appsWaiting) todo.push(['warn', `${fmt(n.appsWaiting)} artist application${n.appsWaiting === 1 ? '' : 's'} waiting`, '/admin/applications', 'Review']);
   if (n.shopsWaiting) todo.push(['warn', `${fmt(n.shopsWaiting)} shop${n.shopsWaiting === 1 ? '' : 's'} waiting for review`, '/admin/sellers', 'Review']);
   if (grace && grace.until) todo.push([grace.on ? grace.level : 'ok', grace.on ? `Old-build grace period: ${grace.verdict.toLowerCase()} (ends ${new Date(grace.until).toISOString().slice(0, 10)}, ${grace.daysLeft} day${grace.daysLeft === 1 ? '' : 's'} left)` : 'Old-build grace period has ended', '/admin/stats#versions', 'Details']);
